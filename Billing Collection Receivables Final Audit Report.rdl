@@ -1,0 +1,2173 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Report MustUnderstand="df" xmlns="http://schemas.microsoft.com/sqlserver/reporting/2016/01/reportdefinition" xmlns:rd="http://schemas.microsoft.com/SQLServer/reporting/reportdesigner" xmlns:df="http://schemas.microsoft.com/sqlserver/reporting/2016/01/reportdefinition/defaultfontfamily">
+  <df:DefaultFontFamily>Segoe UI</df:DefaultFontFamily>
+  <AutoRefresh>0</AutoRefresh>
+  <DataSources>
+    <DataSource Name="DataSource1">
+      <ConnectionProperties>
+        <DataProvider>SQL</DataProvider>
+        <ConnectString>Data Source=anapdlreports;Initial Catalog=Premdat</ConnectString>
+      </ConnectionProperties>
+      <rd:SecurityType>DataBase</rd:SecurityType>
+      <rd:DataSourceID>02ddb8f1-c8b6-4083-8baa-82c51ca03e00</rd:DataSourceID>
+    </DataSource>
+  </DataSources>
+  <DataSets>
+    <DataSet Name="DataSet1">
+      <Query>
+        <DataSourceName>DataSource1</DataSourceName>
+        <CommandText>use Accounting
+declare @ReportDate datetime = cast(GetDate()+1 as date)
+
+
+select top 1 *,
+dateadd(d, -1, cast(cast(DATEPART(m, DATEADD(m, 1, @ReportDate)) as varchar(2)) + '/1/' +  cast(DATEPART(YEAR, DATEADD(m, 1, @ReportDate)) as varchar(4)) as date)) as LastDayOfCurrentMonth,
+dateadd(d, -1, cast(cast(DATEPART(m, @ReportDate) as varchar(2)) + '/1/' +  cast(DATEPART(YEAR, @ReportDate) as varchar(4)) as date)) as LastDayOfLastMonth
+into #LastClose
+from GrandCentral.dbo._ApprovedEOMDates aed (nolock)
+where aed.EOMProcessing &lt;= @ReportDate
+order by aed.EOMDate desc
+
+
+--GET THE LIST OF ALL POLICIES THAT HAVE BEEN INVOICED IN THE LAST 30 DAYS, 
+--IF THEY'VE RECEIVED AN INVOICE LATELY, THEY SHOULDN'T GET ANOTHER
+SELECT distinct id.PolicyID, id.LOB
+into #InvoicedPolicies
+FROM Accounting.dbo.InvoiceMaster im (NOLOCK)
+INNER JOIN Accounting.dbo.InvoiceDetails id (NOLOCK)
+		ON id.InvoiceNumber = im.InvoiceNumber
+WHERE im.InvoiceType &lt;&gt; 30
+AND im.AmountDue &gt;= 50
+AND id.BalanceDue &gt; 0
+and id.LOB &lt;&gt; 'MAC'
+AND im.InvoiceDate &gt;= DATEADD(DAY, -30, DATEDIFF(DAY, 0, @ReportDate))
+
+
+
+
+--FIND ELIGIBLE WC POLICIES, BALANCE CHECK IS LATER
+--declare @ReportDate datetime = '12/4/2019'
+select pd.PolicyID, pd.Policy, 'WC' as LOB, pd.DateEffective, pd.DateExpiration, pd.DateCanc, pd.DateAudit, pd.Eft, pd.BillDaily, reinst.PreparedDate
+into #WC
+from premdat.dbo.PolicyData pd (nolock)
+outer apply (select top 1 eh.PreparedDate
+				from Premdat.dbo.EndmtHistory eh (nolock)
+				where pd.PolicyID = eh.PolicyID
+				and eh.RateType like '%Reinst%'
+				order by eh.IndexID desc) reinst
+where pd.BillType = 'I'
+and pd.AssignedRisk = 0
+and pd.AgtId &lt;&gt; 47
+--and p.TotalBilled - isnull(a.TotalPaid, 0) &gt; 0 
+--and h.HasInvoiceToday = 1
+and (pd.DateCanc is null
+	or pd.DateAudit is not null)
+and 1 = case
+			--any policy that has been audited and Stop Audit Invoice is not turned on should be included
+			when pd.DateAudit is not null 
+				and isnull(pd.StopAuditInvoice, 0) = 0 then 1
+			--non-audited PAYO, MSA, PSR policies should be excluded
+			when pd.PmtPlan in(2,3,4) then 0
+			--non-audited policies with Stop Invoice should be excluded
+			when pd.DateAudit is null
+				and isnull(pd.StopInvoice, 0) = 1 then 0
+			--policies with Stop Audit Invoice should be excluded
+			when isnull(pd.StopAuditInvoice, 0) = 1 then 0
+			--non-cancelled, non-audited, no Stops in place, should be included
+			else 1
+		end
+--HAD TO MOVE THE 30 DAY EXCLUSION TO THE BALANCE CHECK BECAUSE THAT'S ONLY APPLICABLE TO POLICIES THAT ARE PAST THEIR LAST INVOICE DATE
+--FOR MONTHS FOLLOWING A 30 DAY MONTH (LIKE NOVEMBER) ALL THE NORMAL POLICIES THAT SHOULD PICK UP WERE GETTING EXCLUDED BECAUSE THE
+--LAST INVOICE WAS EXACTLY 30 DAYS PRIOR
+----if the policy has been included on an invoice that was eligible to be printed in the last 30 days it should be excluded
+--AND NOT EXISTS(select 1
+--				from #InvoicedPolicies i
+--				where pd.PolicyID = i.PolicyID
+--				and i.LOB like 'WC%')
+
+
+
+
+--FIND ELIGIBLE CPP POLICIES, BALANCE CHECK IS LATER
+--declare @ReportDate datetime = '11/25/2019'
+select pd.PolicyID, pd.Policy + '-' + pd.PolicySuffix as Policy, 'CPP' as LOB, pd.DateEffective, pd.DateExpiration, pd.DateCanc, pd.AuditDate as DateAudit, cp.EFT, cp.BillDaily, reinst.DateProcessed
+into #CPP
+from CPP.dbo.CPPPolicySubData_View pd (nolock)
+inner join CPP.dbo.CPPPolicyCore cp (nolock)
+	on pd.PolicyID = cp.PolicyID
+inner join CPP.dbo.PaymentPlans pp (nolock)
+	on pd.PmtPlan = pp.PPID
+outer apply (select top 1 eh.DateProcessed
+				from CPP.dbo.CPPPolicyEndmtHistory eh (nolock)
+				where pd.PolicyID = eh.PolicyID
+				and eh.TransactionCode = 'REI'
+				order by eh.SeqID desc) reinst
+
+where pp.BillType = 'I'
+and pd.AgtId &lt;&gt; 47
+--and h.HasInvoiceToday = 1
+and (pd.DateCanc is null
+	or pd.AuditDate is not null)
+and 1 = case
+			when pd.AuditDate is not null 
+				and isnull(cp.DoNotInvoiceAfterAudit, 0) = 0 then 1
+			when pd.AuditDate is null
+				and isnull(cp.DoNotInvoice, 0) = 1 then 0
+			when isnull(cp.DoNotInvoiceAfterAudit, 0) = 1 then 0
+			else 1
+		end
+--HAD TO MOVE THE 30 DAY EXCLUSION TO THE BALANCE CHECK BECAUSE THAT'S ONLY APPLICABLE TO POLICIES THAT ARE PAST THEIR LAST INVOICE DATE
+--FOR MONTHS FOLLOWING A 30 DAY MONTH (LIKE NOVEMBER) ALL THE NORMAL POLICIES THAT SHOULD PICK UP WERE GETTING EXCLUDED BECAUSE THE
+--LAST INVOICE WAS EXACTLY 30 DAYS PRIOR
+----if the policy has been included on an invoice that was eligible to be printed in the last 30 days it should be excluded
+--AND NOT EXISTS(select 1
+--				from #InvoicedPolicies i
+--				where pd.PolicyID = i.PolicyID
+--				and i.LOB = 'CPP')
+
+
+----------------------------CREATING SEPARATE TABLES FOR PREMINVAMTS AND ACCTREC FOR SPEED BOOSTS--------------------------
+create index ix_WC_PolicyID
+on #WC(PolicyID)
+
+create index ix_CPP_PolicyID
+on #CPP(PolicyID)
+
+
+--Unfotunately PremDueDate is not always filled in in PremInvAmts, since it's a smalldatetime 
+--I had to create a separate temp table, load it with the data, then do a separate update to fill in
+--the missing dates. It would have been MUCH easier to do ISNULL(pia.PremDueDate, DATEADD(day, 20, pia.PremInvDate))
+--but AWC1041799 has a Dividend record put in with 6/6/2079 as the PremInvDate (which is the largest date smalldatetime can have)
+create table #WCPremInvAmts(PolicyID int, PremInvDate datetime, PremDueDate datetime, Downpayment bit, PremInvAmt money)
+create table #CPPPremInvAmts(PolicyID int, PremInvDate datetime, PremDueDate datetime, Downpayment bit, PremInvAmt money)
+
+
+insert into #WCPremInvAmts
+select pia.PolicyID, pia.PremInvDate, pia.PremDueDate, pia.Downpayment, pia.PremInvAmt
+from #WC w
+inner join Premdat.dbo.PremInvAmts pia (nolocK)
+	on w.PolicyID = pia.PolicyID
+
+
+
+insert into #CPPPremInvAmts
+select pia.PolicyID, pia.PremInvDate, pia.PremDueDate, pia.Downpayment, pia.PremInvAmt
+from #CPP w
+inner join CPP.dbo.PremInvAmts pia (nolocK)
+	on w.PolicyID = pia.PolicyID
+
+
+update pia set
+pia.PremDueDate = dateadd(d, 20, pia.PremInvDate)
+from #WCPremInvAmts pia
+where pia.PremDueDate is null
+
+
+update pia set
+pia.PremDueDate = dateadd(d, 20, pia.PremInvDate)
+from #CPPPremInvAmts pia
+where pia.PremDueDate is null
+
+
+create index ix_WCPremInvAmts_Vals
+on #WCPremInvAmts(PolicyID, PremInvDate, PremDueDate, PremInvAmt, Downpayment)
+
+create index ix_CPPPremInvAmts_Vals
+on #CPPPremInvAmts(PolicyID, PremInvDate, PremDueDate, PremInvAmt, Downpayment)
+
+
+select ar.*
+into #WCAcctRec
+from #WC wc
+inner join Premdat.dbo.AcctRec ar (nolocK)
+	on wc.PolicyID = ar.PolicyID
+where 1 = case
+			when ar.entereddatetime &lt;= '4/30/2007' then 1
+			when ar.TransType = 9 then 0
+			else 1
+		end
+
+
+select ar.*
+into #CPPAcctRec
+from #CPP wc
+inner join CPP.dbo.AcctRec ar (nolocK)
+	on wc.PolicyID = ar.PolicyID
+where 1 = case
+			when ar.entereddatetime &lt;= '4/30/2007' then 1
+			when ar.TransType = 9 then 0
+			else 1
+		end
+
+
+create index ix_WCAcctRec_Vals
+on #WCAcctRec(PolicyID, PaidPrem)
+
+
+create index ix_CPPAcctRec_Vals
+on #CPPAcctRec(PolicyID, PaidPrem)
+
+----------------------------CREATING SEPARATE TABLES FOR PREMINVAMTS AND ACCTREC FOR SPEED BOOSTS--------------------------
+
+
+
+--FILTER ELIGIBLE DOWN TO POLICIES WITH A BALANCE
+--declare @ReportDate datetime = '12/13/2019'
+select *, (p.TotalBilled - isnull(a.TotalPaid, 0) - isnull(pre.PrePostPaid, 0)) as CurrentBalance
+into #WCBal
+from #WC pd
+cross apply (select sum(pia.PremInvAmt) as TotalBilled
+				from #WCPremInvAmts pia (nolock)
+				where pd.Policyid = pia.PolicyID
+				and pia.PremInvDate &lt;= @ReportDate) p
+
+outer apply (select sum(ar.PaidPrem) as TotalPaid
+				from #WCAcctRec ar (nolock)
+				where pd.PolicyID = ar.PolicyID) a
+
+outer apply (select sum(arp.PaidPrem) as PrePostPaid
+				from Accounting.dbo.AcctRecPrePost arp (nolock)
+				where pd.PolicyID = arp.PolicyID
+				and arp.LOB like 'WC%') pre
+
+outer apply (select distinct 1 as HasInvoiceToday
+				from #WCPremInvAmts pia (nolock)
+				where pd.Policyid = pia.PolicyID
+				and pia.PremInvDate = @ReportDate
+				and pia.Downpayment = 0) h
+
+cross apply (select max(pia.PremDueDate) as CurrentDueDate, max(pia.PremInvDate) as CurrentInvDate
+				from #WCPremInvAmts pia (nolock)
+				where pd.Policyid = pia.PolicyID
+				and pia.PremInvDate &lt;= @ReportDate
+				and pia.Downpayment = 0) el
+
+cross apply (select max(pia.PremInvDate) as LastInvDate
+				from #WCPremInvAmts pia (nolock)
+				where pd.Policyid = pia.PolicyID
+				and pia.Downpayment = 0) l
+
+where p.TotalBilled - isnull(a.TotalPaid, 0) - isnull(pre.PrePostPaid, 0) &gt; 0 
+--and el.CurrentDueDate &lt; @ReportDate
+----if the policy has been included on an invoice that was eligible to be printed in the last 30 days it should be excluded
+and 1 = case
+			when l.LastInvDate &lt; @ReportDate
+				and pd.PolicyID in(select i.PolicyID
+										from #InvoicedPolicies i
+										where i.LOB like 'WC%') then 0
+			else 1
+		end
+
+
+		--select * 
+		--from #WCBal w
+		--where w.BillDaily = 1
+		--and 1 = case
+		--			when w.eft = 1
+		--				and w.DateAudit is null then 0
+		--			else 1
+		--		end
+
+
+--FILTER ELIGIBLE DOWN TO POLICIES WITH A BALANCE
+--declare @ReportDate datetime = '12/9/2019'
+select *, (p.TotalBilled - isnull(a.TotalPaid, 0) - isnull(pre.PrePostPaid, 0)) as CurrentBalance
+into #CPPBal
+from #CPP pd
+cross apply (select sum(pia.PremInvAmt) as TotalBilled
+				from #CPPPremInvAmts pia (nolock)
+				where pd.Policyid = pia.PolicyID
+				and pia.PremInvDate &lt;= @ReportDate) p
+
+outer apply (select sum(ar.PaidPrem) as TotalPaid
+				from #CPPAcctRec ar (nolock)
+				where pd.PolicyID = ar.PolicyID) a
+
+outer apply (select sum(arp.PaidPrem) as PrePostPaid
+				from Accounting.dbo.AcctRecPrePost arp (nolock)
+				where pd.PolicyID = arp.PolicyID
+				and arp.LOB = 'CPP') pre
+				
+outer apply (select distinct 1 as HasInvoiceToday
+				from #CPPPremInvAmts pia (nolock)
+				where pd.Policyid = pia.PolicyID
+				and pia.PremInvDate = @ReportDate
+				and pia.Downpayment = 0) h
+
+cross apply (select max(pia.PremDueDate) as CurrentDueDate, max(pia.PremInvDate) as CurrentInvDate
+				from #CPPPremInvAmts pia (nolock)
+				where pd.Policyid = pia.PolicyID
+				and pia.PremInvDate &lt;= @ReportDate
+				and pia.Downpayment = 0) el
+
+cross apply (select max(pia.PremInvDate) as LastInvDate
+				from #CPPPremInvAmts pia (nolock)
+				where pd.Policyid = pia.PolicyID
+				and pia.Downpayment = 0) l
+
+where p.TotalBilled - isnull(a.TotalPaid, 0) - isnull(pre.PrePostPaid, 0) &gt; 0 
+--and el.CurrentDueDate &lt; @ReportDate
+----if the policy has been included on an invoice that was eligible to be printed in the last 30 days it should be excluded
+and 1 = case
+			when l.LastInvDate &lt; @ReportDate
+				and pd.PolicyID in(select i.PolicyID
+										from #InvoicedPolicies i
+										where i.LOB = 'CPP') then 0
+			else 1
+		end
+
+
+--COMBINE THE FILTERED DOWN WC AND CPP POLICIES AND FIND THE BILLING DAY OF THE MONTH FOR DAILY BILL
+--declare @ReportDate datetime = '12/4/2019'
+select t.*, mad.MasterAccountID, ma.BillDailyDayOfMonth, 
+case
+
+	--only use the Bill Day of the Month calculation if there are no more installments
+	when t.LastInvDate &gt; @ReportDate then t.CurrentInvDate
+
+	--as long as the Billing day of the month isn't past the last day of the current month
+	when ma.BillDailyDayOfMonth &lt;= DATEPART(day, lc.LastDayOfCurrentMonth) 
+		--if the Report Date is on or before the Billing date, the last Invoice Date was this month
+		and ma.BillDailyDayOfMonth &lt;= DATEPART(day, @ReportDate)
+				then cast(cast(DATEPART(month, @ReportDate) as varchar(2)) + '/' +  cast(ma.BillDailyDayOfMonth as varchar(2)) + '/' +  cast(DATEPART(YEAR, @ReportDate) as varchar(4)) as date)
+
+	when ma.BillDailyDayOfMonth &lt;= DATEPART(day, lc.LastDayOfCurrentMonth) 
+		--if the Report Date is after the Billing date check if the Billing date is past last month's last day and use that day from last month
+		and ma.BillDailyDayOfMonth  &gt; DATEPART(day, @ReportDate)
+		and ma.BillDailyDayOfMonth &lt;= DATEPART(day, lc.LastDayOfLastMonth)
+				then cast(cast(DATEPART(month, DATEADD(month, -1, @ReportDate)) as varchar(2)) + '/' + cast(ma.BillDailyDayOfMonth as varchar(2)) + '/' +  cast(DATEPART(YEAR, DATEADD(month, -1, @ReportDate)) as varchar(4)) as date)
+
+	when ma.BillDailyDayOfMonth &gt; DATEPART(day, lc.LastDayOfCurrentMonth) 
+		--since the Bill date is later than the last day of the current month, check if it's less than or equal to last month's last day 
+		and ma.BillDailyDayOfMonth &lt;= DATEPART(day, lc.LastDayOfLastMonth) 
+				then cast(cast(DATEPART(month, DATEADD(month, -1, @ReportDate)) as varchar(2)) + '/' + cast(ma.BillDailyDayOfMonth as varchar(2)) + '/' +  cast(DATEPART(YEAR, DATEADD(month, -1, @ReportDate)) as varchar(4)) as date)
+
+	----if the bill day of the month is 31, use the last day of the current month
+	when ma.BillDailyDayOfMonth is null then lc.EOMProcessing
+
+	else lc.LastDayOfLastMonth
+
+end as LastDayPolicyShouldInvoice
+
+into #Combined
+from (select *
+		from #WCBal
+
+		union all
+
+		select * 
+		from #CPPBal) t
+inner join GrandCentral.dbo.MasterAccountDetail mad (nolock)
+	on t.PolicyID = mad.PolicyID
+	and 1 = case
+				when t.LOB = 'WC'
+					and mad.LOB like 'WC%'
+					and mad.LOB &lt;&gt; 'WCO' then 1
+				when t.LOB = mad.LOB then 1
+				else 0
+			end
+	and mad.DeletedDate is null
+inner join GrandCentral.dbo.MasterAccount ma (nolock)
+	on mad.MasterAccountID = ma.MasterAccountID
+cross apply (select *
+				from #LastClose) lc
+
+
+				
+
+
+--DO THE FINAL PULL AND FILTER OUT POLICIES THAT SHOULD NOT BE CONSIDERED OUTSTANDING
+--declare @ReportDate datetime = '12/13/2019'
+select c.*, cc.CollectionID, li.LastInvoice
+into #Filtered
+from #Combined c
+left join collections.dbo.CollCollections cc (nolock)
+	on c.PolicyID = cc.PolicyID
+	and 1 = case	
+				when c.LOB like 'WC%' 
+					and cc.LOB like 'WC%' then 1
+				when c.LOB = cc.LOB then 1
+				else 0
+			end
+	and cc.Outstanding = 1
+
+outer apply (select max(im.InvoiceDate) as LastInvoice
+				from dbo.InvoiceMaster im (nolock)
+				inner join dbo.InvoiceDetails id (nolock)
+					on im.InvoiceNumber = id.InvoiceNumber
+				where id.PolicyID = c.PolicyID
+				and 1 = case	
+							when c.LOB like 'WC%' 
+								and id.LOB like 'WC%' then 1
+							when c.LOB = id.LOB then 1
+							else 0
+						end
+				and id.BalanceDue &gt; 0	
+				and im.AmountDue &gt;= 50	
+						) li
+cross apply (select *
+				from #LastClose) lc
+
+where cc.CollectionID is null
+and c.DateEffective &lt;= @ReportDate
+--and DATEDIFF(d, c.LastDayPolicyShouldInvoice, @ReportDate) &lt;= 30 
+
+and 1 = case
+			--if the report is being pulled for a Monday, include Saturday and Sunday as well
+			when DATEPART(dw, @ReportDate) = 2 
+				and c.LastDayPolicyShouldInvoice between dateadd(d, -2, @ReportDate) and @ReportDate then 1
+
+			--for any other day of the week, just get the details for that day
+			when DATEPART(dw, @ReportDate) &lt;&gt; 2
+				and c.LastDayPolicyShouldInvoice  = @ReportDate then 1
+			else 0
+		end
+
+--exclusions for found issues
+and 1 = case
+			--audited policies still marked as EFT are being excluded from invoicing AND ACH
+			--when c.Eft = 1
+			--	and c.DateAudit is not null then 0
+
+			----audited policies with no AcctRec activity
+			--when c.DateAudit is not null
+			--	and c.TotalPaid is null then 0
+			
+			----policy is daily bill, but Bill Daily Day of Month isn't filled out on the MAC
+			--when c.BillDaily = 1 
+			--	and isnull(c.BillDailyDayOfMonth, 0) = 0  then 0
+
+--REAL EXCLUSIONS
+			--if the policy is set to bill at the end of the month and was just audited this month, it's not going to invoice until EOM
+			when c.BillDaily = 0
+				and c.DateAudit is not null
+				and c.DateAudit &gt;= lc.EOMProcessing then 0
+
+			--only show monthly bill policies on the day they're supposed to invoice
+			when c.BillDaily = 0
+				and @ReportDate &lt;&gt; (select EOMProcessing from #LastClose) then 0
+
+			--if the policy was in a cancelled status when the last invoice was supposed to happen, it won't get picked up until the next invoice
+			when c.DateCanc is null
+				and c.PreparedDate is not null
+				and cast(c.PreParedDate as date) &gt;= c.LastDayPolicyShouldInvoice then 0
+
+			--if there isn't a Current Due date it's because all the installments are in the future and the only billed item is the downpayment
+			when c.CurrentDueDate is null
+				and c.DateCanc is null
+				and c.DateAudit is null then 0
+
+			else 1
+		end
+
+
+--was getting false positives when calculating the MAC balance prior to filtering out policies in Collections
+select *
+from #Filtered c
+cross apply (select sum(mc.CurrentBalance) as MACBalance
+				from #Filtered mc
+				where c.MasterAccountID = mc.masterAccountID) bal
+where bal.MACBalance &gt;= 50
+		
+		select *
+		from #WCBal
+		where BillDaily = 1
+		and currentbalance &gt; 0
+
+		select *
+		from #CPPBal
+		where BillDaily = 1
+		and currentbalance &gt; 0
+
+
+		select *
+		from #Combined c
+		where c.HasInvoiceToday = 1
+
+
+		select c.MasterAccountId, sum(c.CurrentBalance) as MACTot
+		from #Combined c
+		where c.LastDayPolicyShouldInvoice = '12/13/2019'
+		group by c.MasterAccountId
+		having sum(c.CurrentBalance) &gt;= 50
+
+
+drop table #LastClose
+drop table #InvoicedPolicies
+drop table #WC
+drop table #CPP
+drop table #WCPremInvAmts
+drop table #CPPPremInvAmts
+drop table #WCAcctRec
+drop table #CPPAcctRec
+
+
+drop table #WCBal
+drop table #CPPBal
+drop table #Combined
+drop table #Filtered</CommandText>
+        <rd:UseGenericDesigner>true</rd:UseGenericDesigner>
+      </Query>
+      <Fields>
+        <Field Name="PolicyID">
+          <DataField>PolicyID</DataField>
+          <rd:TypeName>System.Int32</rd:TypeName>
+        </Field>
+        <Field Name="Policy">
+          <DataField>Policy</DataField>
+          <rd:TypeName>System.String</rd:TypeName>
+        </Field>
+        <Field Name="LOB">
+          <DataField>LOB</DataField>
+          <rd:TypeName>System.String</rd:TypeName>
+        </Field>
+        <Field Name="DateEffective">
+          <DataField>DateEffective</DataField>
+          <rd:TypeName>System.DateTime</rd:TypeName>
+        </Field>
+        <Field Name="DateExpiration">
+          <DataField>DateExpiration</DataField>
+          <rd:TypeName>System.DateTime</rd:TypeName>
+        </Field>
+        <Field Name="DateCanc">
+          <DataField>DateCanc</DataField>
+          <rd:TypeName>System.DateTime</rd:TypeName>
+        </Field>
+        <Field Name="DateAudit">
+          <DataField>DateAudit</DataField>
+          <rd:TypeName>System.DateTime</rd:TypeName>
+        </Field>
+        <Field Name="Eft">
+          <DataField>Eft</DataField>
+          <rd:TypeName>System.Boolean</rd:TypeName>
+        </Field>
+        <Field Name="BillDaily">
+          <DataField>BillDaily</DataField>
+          <rd:TypeName>System.Boolean</rd:TypeName>
+        </Field>
+        <Field Name="PreparedDate">
+          <DataField>PreparedDate</DataField>
+          <rd:TypeName>System.DateTime</rd:TypeName>
+        </Field>
+        <Field Name="TotalBilled">
+          <DataField>TotalBilled</DataField>
+          <rd:TypeName>System.Decimal</rd:TypeName>
+        </Field>
+        <Field Name="TotalPaid">
+          <DataField>TotalPaid</DataField>
+          <rd:TypeName>System.Decimal</rd:TypeName>
+        </Field>
+        <Field Name="HasInvoiceToday">
+          <DataField>HasInvoiceToday</DataField>
+          <rd:TypeName>System.Int32</rd:TypeName>
+        </Field>
+        <Field Name="PrePostPaid">
+          <DataField>PrePostPaid</DataField>
+          <rd:TypeName>System.Decimal</rd:TypeName>
+        </Field>
+        <Field Name="CurrentBalance">
+          <DataField>CurrentBalance</DataField>
+          <rd:TypeName>System.Decimal</rd:TypeName>
+        </Field>
+        <Field Name="MasterAccountID">
+          <DataField>MasterAccountID</DataField>
+          <rd:TypeName>System.Int32</rd:TypeName>
+        </Field>
+        <Field Name="CurrentDueDate">
+          <DataField>CurrentDueDate</DataField>
+          <rd:TypeName>System.DateTime</rd:TypeName>
+        </Field>
+        <Field Name="BillDailyDayOfMonth">
+          <DataField>BillDailyDayOfMonth</DataField>
+          <rd:TypeName>System.Byte</rd:TypeName>
+        </Field>
+        <Field Name="CurrentInvDate">
+          <DataField>CurrentInvDate</DataField>
+          <rd:TypeName>System.DateTime</rd:TypeName>
+        </Field>
+        <Field Name="CollectionID">
+          <DataField>CollectionID</DataField>
+          <rd:TypeName>System.Int32</rd:TypeName>
+        </Field>
+        <Field Name="MACBalance">
+          <DataField>MACBalance</DataField>
+          <rd:TypeName>System.Decimal</rd:TypeName>
+        </Field>
+        <Field Name="LastInvDate">
+          <DataField>LastInvDate</DataField>
+          <rd:TypeName>System.DateTime</rd:TypeName>
+        </Field>
+        <Field Name="LastDayPolicyShouldInvoice">
+          <DataField>LastDayPolicyShouldInvoice</DataField>
+          <rd:TypeName>System.DateTime</rd:TypeName>
+        </Field>
+        <Field Name="LastInvoice">
+          <DataField>LastInvoice</DataField>
+          <rd:TypeName>System.DateTime</rd:TypeName>
+        </Field>
+      </Fields>
+    </DataSet>
+  </DataSets>
+  <ReportSections>
+    <ReportSection>
+      <Body>
+        <ReportItems>
+          <Textbox Name="textbox1">
+            <CanGrow>true</CanGrow>
+            <KeepTogether>true</KeepTogether>
+            <Paragraphs>
+              <Paragraph>
+                <TextRuns>
+                  <TextRun>
+                    <Value>Invoice Control Report</Value>
+                    <Style>
+                      <FontFamily>Segoe UI Light</FontFamily>
+                      <FontSize>24pt</FontSize>
+                      <FontWeight>Bold</FontWeight>
+                    </Style>
+                  </TextRun>
+                </TextRuns>
+                <Style />
+              </Paragraph>
+            </Paragraphs>
+            <rd:DefaultName>textbox1</rd:DefaultName>
+            <Height>0.43in</Height>
+            <Width>18in</Width>
+            <Style>
+              <PaddingLeft>2pt</PaddingLeft>
+              <PaddingRight>2pt</PaddingRight>
+              <PaddingTop>2pt</PaddingTop>
+              <PaddingBottom>2pt</PaddingBottom>
+            </Style>
+          </Textbox>
+          <Tablix Name="table1">
+            <TablixBody>
+              <TablixColumns>
+                <TablixColumn>
+                  <Width>0.72917in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>0.54167in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>0.94792in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1.45833in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1.3125in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1.47917in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1.79167in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1in</Width>
+                </TablixColumn>
+              </TablixColumns>
+              <TablixRows>
+                <TablixRow>
+                  <Height>0.22in</Height>
+                  <TablixCells>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox2">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Policy ID</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <FontFamily />
+                                <TextAlign>Right</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox2</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox3">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Policy</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox3</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox4">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>LOB</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox4</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox5">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Date Eff</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox5</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox6">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Date Ex</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox6</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox7">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Date Canc</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox7</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox8">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Date Audit</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox8</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox9">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Eft</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox9</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox10">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Bill Daily</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox10</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox11">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Total Billed</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <FontFamily />
+                                <TextAlign>Right</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox11</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox12">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Total Paid</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <FontFamily />
+                                <TextAlign>Right</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox12</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox13">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Has Invoice Today</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <FontFamily />
+                                <TextAlign>Right</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox13</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox14">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Current Balance</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <FontFamily />
+                                <TextAlign>Right</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox14</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox15">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Master Account ID</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <FontFamily />
+                                <TextAlign>Right</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox15</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox16">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Bill Daily Day Of Month</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <FontFamily />
+                                <TextAlign>Right</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox16</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox17">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Collection ID</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <FontFamily />
+                                <TextAlign>Right</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox17</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox18">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>MACBalance</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <FontFamily />
+                                <TextAlign>Right</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox18</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox19">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Last Inv Date</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox19</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                  </TablixCells>
+                </TablixRow>
+                <TablixRow>
+                  <Height>0.21in</Height>
+                  <TablixCells>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="PolicyID">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!PolicyID.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>PolicyID</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <BackgroundColor>=IIF(ROWNUMBER(NOTHING) MOD 2, "White", "WhiteSmoke")</BackgroundColor>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="Policy">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!Policy.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>Policy</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <BackgroundColor>=IIF(ROWNUMBER(NOTHING) MOD 2, "White", "WhiteSmoke")</BackgroundColor>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="LOB">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!LOB.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>LOB</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <BackgroundColor>=IIF(ROWNUMBER(NOTHING) MOD 2, "White", "WhiteSmoke")</BackgroundColor>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="DateEffective">
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!DateEffective.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Format>d</Format>
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>DateEffective</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <BackgroundColor>=IIF(ROWNUMBER(NOTHING) MOD 2, "White", "WhiteSmoke")</BackgroundColor>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="DateExpiration">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!DateExpiration.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Format>d</Format>
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>DateExpiration</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <BackgroundColor>=IIF(ROWNUMBER(NOTHING) MOD 2, "White", "WhiteSmoke")</BackgroundColor>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="DateCanc">
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!DateCanc.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Format>d</Format>
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>DateCanc</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <BackgroundColor>=IIF(ROWNUMBER(NOTHING) MOD 2, "White", "WhiteSmoke")</BackgroundColor>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="DateAudit">
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!DateAudit.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Format>d</Format>
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>DateAudit</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <BackgroundColor>=IIF(ROWNUMBER(NOTHING) MOD 2, "White", "WhiteSmoke")</BackgroundColor>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="Eft">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!Eft.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>Eft</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <BackgroundColor>=IIF(ROWNUMBER(NOTHING) MOD 2, "White", "WhiteSmoke")</BackgroundColor>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="BillDaily">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!BillDaily.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>BillDaily</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <BackgroundColor>=IIF(ROWNUMBER(NOTHING) MOD 2, "White", "WhiteSmoke")</BackgroundColor>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="TotalBilled">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!TotalBilled.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Format>'$'#,0;('$'#,0)</Format>
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>TotalBilled</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <BackgroundColor>=IIF(ROWNUMBER(NOTHING) MOD 2, "White", "WhiteSmoke")</BackgroundColor>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                            <rd:FormatSymbolCulture>en-US</rd:FormatSymbolCulture>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="TotalPaid">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!TotalPaid.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Format>'$'#,0;('$'#,0)</Format>
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>TotalPaid</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <BackgroundColor>=IIF(ROWNUMBER(NOTHING) MOD 2, "White", "WhiteSmoke")</BackgroundColor>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                            <rd:FormatSymbolCulture>en-US</rd:FormatSymbolCulture>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="HasInvoiceToday">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!HasInvoiceToday.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>HasInvoiceToday</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <BackgroundColor>=IIF(ROWNUMBER(NOTHING) MOD 2, "White", "WhiteSmoke")</BackgroundColor>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="CurrentBalance">
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!CurrentBalance.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Format>'$'#,0;('$'#,0)</Format>
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>CurrentBalance</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <BackgroundColor>=IIF(ROWNUMBER(NOTHING) MOD 2, "White", "WhiteSmoke")</BackgroundColor>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                            <rd:FormatSymbolCulture>en-US</rd:FormatSymbolCulture>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="MasterAccountID">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!MasterAccountID.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>MasterAccountID</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <BackgroundColor>=IIF(ROWNUMBER(NOTHING) MOD 2, "White", "WhiteSmoke")</BackgroundColor>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="BillDailyDayOfMonth">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!BillDailyDayOfMonth.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>BillDailyDayOfMonth</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <BackgroundColor>=IIF(ROWNUMBER(NOTHING) MOD 2, "White", "WhiteSmoke")</BackgroundColor>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="CollectionID">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!CollectionID.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>CollectionID</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <BackgroundColor>=IIF(ROWNUMBER(NOTHING) MOD 2, "White", "WhiteSmoke")</BackgroundColor>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="MACBalance">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!MACBalance.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Format>'$'#,0;('$'#,0)</Format>
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>MACBalance</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <BackgroundColor>=IIF(ROWNUMBER(NOTHING) MOD 2, "White", "WhiteSmoke")</BackgroundColor>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                            <rd:FormatSymbolCulture>en-US</rd:FormatSymbolCulture>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="LastInvDate">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!LastInvDate.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Format>d</Format>
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>LastInvDate</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <BackgroundColor>=IIF(ROWNUMBER(NOTHING) MOD 2, "White", "WhiteSmoke")</BackgroundColor>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                  </TablixCells>
+                </TablixRow>
+              </TablixRows>
+            </TablixBody>
+            <TablixColumnHierarchy>
+              <TablixMembers>
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+              </TablixMembers>
+            </TablixColumnHierarchy>
+            <TablixRowHierarchy>
+              <TablixMembers>
+                <TablixMember>
+                  <KeepWithGroup>After</KeepWithGroup>
+                  <RepeatOnNewPage>true</RepeatOnNewPage>
+                  <KeepTogether>true</KeepTogether>
+                </TablixMember>
+                <TablixMember>
+                  <Group Name="table1_Details_Group">
+                    <DataElementName>Detail</DataElementName>
+                  </Group>
+                  <TablixMembers>
+                    <TablixMember />
+                  </TablixMembers>
+                  <DataElementName>Detail_Collection</DataElementName>
+                  <DataElementOutput>Output</DataElementOutput>
+                  <KeepTogether>true</KeepTogether>
+                </TablixMember>
+              </TablixMembers>
+            </TablixRowHierarchy>
+            <DataSetName>DataSet1</DataSetName>
+            <Top>0.43in</Top>
+            <Height>0.43in</Height>
+            <Width>19.26042in</Width>
+            <ZIndex>1</ZIndex>
+            <Style />
+          </Tablix>
+        </ReportItems>
+        <Height>1.87042in</Height>
+        <Style />
+      </Body>
+      <Width>20.70833in</Width>
+      <Page>
+        <LeftMargin>1in</LeftMargin>
+        <RightMargin>1in</RightMargin>
+        <TopMargin>1in</TopMargin>
+        <BottomMargin>1in</BottomMargin>
+        <Style />
+      </Page>
+    </ReportSection>
+  </ReportSections>
+  <ReportParametersLayout>
+    <GridLayoutDefinition>
+      <NumberOfColumns>4</NumberOfColumns>
+      <NumberOfRows>2</NumberOfRows>
+    </GridLayoutDefinition>
+  </ReportParametersLayout>
+  <Language>en-US</Language>
+  <ConsumeContainerWhitespace>true</ConsumeContainerWhitespace>
+  <rd:ReportUnitType>Inch</rd:ReportUnitType>
+  <rd:ReportID>6f54349e-8749-4943-9fae-61e8c18a1fe8</rd:ReportID>
+</Report>

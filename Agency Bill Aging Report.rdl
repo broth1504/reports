@@ -1,0 +1,4030 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Report MustUnderstand="df" xmlns="http://schemas.microsoft.com/sqlserver/reporting/2016/01/reportdefinition" xmlns:rd="http://schemas.microsoft.com/SQLServer/reporting/reportdesigner" xmlns:df="http://schemas.microsoft.com/sqlserver/reporting/2016/01/reportdefinition/defaultfontfamily">
+  <df:DefaultFontFamily>Segoe UI</df:DefaultFontFamily>
+  <AutoRefresh>0</AutoRefresh>
+  <DataSources>
+    <DataSource Name="DataSource1">
+      <ConnectionProperties>
+        <DataProvider>SQL</DataProvider>
+        <ConnectString>Data Source=anapdlprem;Initial Catalog=Accounting</ConnectString>
+        <IntegratedSecurity>true</IntegratedSecurity>
+      </ConnectionProperties>
+      <rd:SecurityType>Integrated</rd:SecurityType>
+      <rd:DataSourceID>1e1b0139-e1ad-4b2c-b7e2-62127a5f7831</rd:DataSourceID>
+    </DataSource>
+  </DataSources>
+  <DataSets>
+    <DataSet Name="DataSet1">
+      <Query>
+        <DataSourceName>DataSource1</DataSourceName>
+        <CommandText>--declare @Date as date = eomonth(GetDate(),-2)
+--select @Date
+
+
+
+USE Accounting
+declare @EOMDate date = eomonth(GetDate(),-1)
+--eomonth(GetDate(),-2)
+declare @PrevEOMDate date = null; --'11/30/2018';
+
+drop table if exists #WCPolicies
+drop table if exists #WCAges 
+drop table if exists #WCPremInvAmts
+drop table if exists #WC0To30Bal, #WC30To60Bal, #WC60To90Bal, #WC90to180, #WC180To365Bal, #WCOver365
+
+drop table if exists #CPPPolicies
+drop table if exists #CPPAges, #CPPPremInvAmts
+drop table if exists #CPP0To30Bal, #CPP30To60Bal, #CPP60To90Bal, #CPP90to180, #CPP180To365Bal, #CPPOver365
+drop table if exists #GlobalData
+drop table if exists #ExcelCalc
+
+-----------------------------------------------------WC---------------------------------------------------
+--Get all of the information besides the amounts
+select pd.PolicyID, 
+cast(getdate() as date) as ReportDate, 
+pd.FirmID, 
+pd.AgtId,
+pd.AgtGroup,
+pd.UwOfc,
+'WC' as LOB,
+pd.Policy,
+pd.DateEffective,
+pd.DateExpiration,
+pd.DateAudit,
+pd.DateCanc,
+pd.BillType,
+'WC' as ProductType,
+pd.NoRefund,
+pd.StopInvoice,
+pd.StopAuditInvoice,
+col.[Collections Start Date],
+inst.TotalTax,
+inst.TotalFee,
+inst.BilledTax,
+inst.BilledFee,
+case
+	when pd.BillType = 'A' then (isnull(inst.FutureDue, 0) - round((inst.FutureDue - inst.FutureTax - inst.FutureFee) * (pd.ComRate1/100), 2, 0))
+	else isnull(inst.FutureDue, 0)
+end as FutureDue,
+pd.Bankruptcy,
+pd.ComRate1,
+--2/4/2019 - JKS - per Susan Houston, when reporting Agency Bill the Policy Cost should be Policy Cost less Expected Commissions
+case
+	when pd.BillType = 'A' then (isnull(inst.PolicyCost, 0) - round(inst.PremBase * (pd.ComRate1/100), 2, 0)) 
+	else isnull(inst.PolicyCost, 0)
+end as PolicyCost,
+--2/4/2019 - JKS - per Susan Houston, if a policy is on Agency Bill we only want to show the balance of the expected net (Policy Cost - Taxes - Fees - Expected Kept Commission) - Net Payment remitted from Agent
+case
+	when pd.BillType = 'A' then isnull(a.CashPaid, 0) + (isnull(prev.DirectBillPaid, 0) - isnull(dc.DirectBillCommission, 0))
+	else isnull(a.TotalPaid, 0) + isnull(prev.DirectBillPaid, 0)
+end	as TotPaid,
+--2/4/2019 - JKS - per Susan Houston, when reporting Agency Bill the overall balance should be the Policy Cost less Expected Commissions less Net Payment remitted from Agent
+case
+	when pd.BillType = 'A' then (isnull(inst.PolicyCost, 0) - round(inst.PremBase * (pd.ComRate1/100), 2, 0)) - (isnull(a.CashPaid, 0) + (isnull(prev.DirectBillPaid, 0) - isnull(dc.DirectBillCommission, 0)))
+	else isnull(inst.PolicyCost, 0) - (isnull(a.TotalPaid, 0) + isnull(prev.DirectBillPaid, 0)) 
+end as Balance
+
+into #WCPolicies
+--from dbo.EOM_Premdat_PolicyData_4 pd (nolock)
+
+from Premdat.dbo.PolicyData pd  (nolock)
+
+cross apply (select a.AgtName
+				from Premdat.dbo.Agents a (nolock)
+				where pd.agtid = a.agtid) agt
+
+outer apply (select sum(round(pia.PremInvAmt, 2, 0)) as PolicyCost, sum(round(pia.PremInvAmt, 2, 0) - round(pia.TaxAmt, 2, 0) - round(pia.FeeAmt, 2, 0)) as PremBase,
+				sum(case
+						when cast(pia.PremInvDate as date) &lt;= @EOMDate  AND (@PrevEOMDate IS NULL OR cast(pia.PremInvDate as date) &gt; @PrevEOMDate)
+						then round(pia.PremInvAmt, 2, 0)
+						
+						else 0
+					end) as CurrentBilled,
+				sum(case
+						when cast(pia.PremInvDate as date) &lt;= @EOMDate  AND (@PrevEOMDate IS NULL OR cast(pia.PremInvDate as date) &gt; @PrevEOMDate)
+						then round(pia.PremInvAmt, 2, 0) - round(pia.TaxAmt, 2, 0) - round(pia.FeeAmt, 2, 0)
+						else 0
+					end) as CurrentBilledPremBase,
+				sum(round(pia.TaxAmt, 2, 0)) as TotalTax,
+				sum(round(pia.FeeAmt, 2, 0)) as TotalFee,
+				sum(case
+						when cast(pia.PremInvDate as date) &lt;= @EOMDate  AND (@PrevEOMDate IS NULL OR cast(pia.PremInvDate as date) &gt; @PrevEOMDate)
+						then round(pia.TaxAmt, 2, 0)
+						else 0
+					end) as BilledTax,
+				sum(case
+						when cast(pia.PremInvDate as date) &lt;= @EOMDate AND (@PrevEOMDate IS NULL OR cast(pia.PremInvDate as date) &gt; @PrevEOMDate)
+						then round(pia.FeeAmt, 2, 0)
+						else 0
+					end) as BilledFee,
+				sum(case
+						when cast(pia.PremInvDate as date) &gt; @EOMDate 
+						then round(pia.PremInvAmt, 2, 0)
+						else 0
+					end) as FutureDue,
+				sum(case
+						when cast(pia.PremInvDate as date) &gt; @EOMDate 
+						 then round(pia.TaxAmt, 2, 0)
+						else 0
+					end) as FutureTax,
+				sum(case
+						when cast(pia.PremInvDate as date) &gt; @EOMDate  AND (@PrevEOMDate IS NULL OR cast(pia.PremInvDate as date) &gt; @PrevEOMDate)
+						then round(pia.FeeAmt, 2, 0)
+						else 0
+					end) as FutureFee
+				--from dbo.EOM_Premdat_PremInvAmts_4 pia (nolock)
+				from Premdat.dbo.PremInvAmts pia (nolock)
+				where pd.PolicyID = pia.PolicyID) inst
+				
+--split out the full paid vs cash paid for Agency Bill
+--age Agency Bill based on expected net amount to net receive from the agent
+--policy that switched from Direct to Agency and had Direct payments we need to reduce the paid by insured amount by the commission paid 
+--to make sure that we're using the same basis for all payments
+
+--Agency Bill Payments
+outer apply (select sum(round(isnull(ar.PaidPrem, 0), 2, 0)) as TotalPaid, 
+				sum(round(isnull(case
+									when ar.PaidCom &lt;&gt; 0
+										and isnull(ar.BordereauItem, 0) = 0 then round(ar.PaidPrem, 2, 0) - round(ar.PaidCom, 2, 0)
+										else round(ar.CashPaid, 2, 0)
+									end, 0), 2, 0)) as CashPaid
+				--from dbo.EOM_Premdat_AcctRec_4 ar (nolock)
+				from Premdat.dbo.AcctRec ar (nolock)
+				where pd.PolicyID = ar.PolicyID
+				and ar.TransType &lt;&gt; 9
+				--and ar.EnteredBy &lt;&gt; 'FNPImport'
+				and 1 = case
+							when isnull(ar.BordereauItem, 0) &gt; 0 
+								and isnull(ar.CashLibIndex, 0) = 0 
+								and  ar.PaidCom &lt;&gt; 0 then 1
+							when ar.PaidCom &lt;&gt; 0 
+								and isnull(ar.BordereauItem, 0) = 0
+								and pd.BillType = 'A' then 1
+							else 0
+						end
+				) a
+
+--Direct Bill Payments
+outer apply (select sum(round(isnull(ar.PaidPrem, 0), 2, 0)) as DirectBillPaid
+				--from dbo.EOM_Premdat_AcctRec_4 ar (nolock)
+				from Premdat.dbo.AcctRec ar (nolock)
+				where pd.PolicyID = ar.PolicyID
+				and ar.TransType &lt;&gt; 9
+				--and ar.EnteredBy &lt;&gt; 'FNPImport'
+				and 1 = case
+							when isnull(ar.BordereauItem, 0) &gt; 0 
+								and isnull(ar.CashLibIndex, 0) = 0 
+								and  ar.PaidCom &lt;&gt; 0 then 0
+							when ar.PaidCom &lt;&gt; 0 
+								and isnull(ar.BordereauItem, 0) = 0
+								and pd.BillType = 'A' then 0
+							else 1
+						end
+				) prev
+
+--outer apply (select sum(round(ac.Paid, 2, 0)) as DirectBillCommission
+--				--from dbo.EOM_Premdat_AgtCommission_4 ac (nolock)
+--				from Premdat.dbo.AgtCommission ac (nolock)
+--				where pd.PolicyID = ac.PolicyId
+--				and ac.TransType = 4) dc
+outer apply (select sum(case
+							--anything that's not an Amount DUE to us from the Agent needs to be in a Paid Status to be included in the Direct Bill Commission Paid
+							when t.RecType &lt;&gt; 'DUE' 
+								and t.PayableStatus = 'Paid' then t.CommAmt
+						
+							--if the net of an Agent's statement is negative and they owe us, only include the credit until it is cleared off 
+							when t.PayableRecType = 'DUE'
+								and isnull(t.DueCleared, 0) = 0 then t.CommAmt
+							else 0
+						end) as DirectBillCommission
+				from 
+					(select ac.*, p.RecType as PayableRecType, s.PayableStatus, ds.DueCleared
+					from Accounting.dbo.AFSICommission ac (nolock)
+					inner join Accounting.dbo.Payables p (nolock)
+						on ac.MasterAgtID = p.ParentID
+						and p.ParentType = 5 --Agent
+						and ac.PayableID = p.PayableID
+						and ac.Eligible = p.StatementDate
+						and cast(p.EnteredDateTime as date) &lt;= @EOMDate
+					--to get the status of whether a given amount has actually been paid we need to find the latest roll-up record
+					--the type of the latest record tells us whether the money is still on the Agent's account or has been sent out
+					cross apply (select top 1 case
+												when p2.RecType in('CPMT', 'EPMT', 'CREIS', 'EREIS', 'CSGL', 'ECHT') then 'Paid' --BConnolly - Moved outgoing escheatments to the paid status
+												when p2.RecType in('CPBL', 'CRTN', 'ERTN', 'VOID', 'STOP', 'SECHT', 'VECHT') then 'Outstanding'
+												when p2.RecType = 'DUE' then 'DUE'
+												else 'Unknown'
+											end as PayableStatus
+									from Accounting.dbo.Payables p2 (nolock)
+									where p.ParentID = p2.ParentID
+									and p.ParentType = p2.ParentType
+									and cast(p2.EnteredDateTime as date) &lt;= @EOMDate
+									and p2.TransType = 4 --BConnolly - For stops I'm making sure the transtype of the stop record matches the record of the check being stopped. So if we stop a bonus/profit (transtype 14) those stops will not pull here. 
+									and cast(p.PayableID as varchar(30)) = JSON_VALUE(p2.SupportingInfo, '$.ORIGPAYABLEID')
+									order by p2.PayableID desc) s
+					--if the original Payable was a DUE amount we need to check to see if there's been any positive activity
+					--on the agent after the DUE amount was incurred,
+					--the only way for an agent to have a positive TransType 4 is their statement's activity has to take them above
+					--the threshold, once a DUE amount has been cleared it's no longer outstanding
+					outer apply (select distinct 1 as DueCleared
+									from Accounting.dbo.Payables p3 (nolock)
+									where p.ParentID = p3.ParentID
+									and p.ParentType = p3.ParentType
+									and cast(p3.EnteredDateTime as date) &lt;= @EOMDate
+									and p3.EnteredDateTime &gt; p.EnteredDateTime
+									and p.RecType = 'DUE'
+									and p3.TransType = 4
+									and p3.StatementAmt &gt; 0) ds
+					where pd.policyid = ac.PolicyId
+					and ac.LOB = 'WC'
+					and cast(ac.StatementDate as date) &lt;= @EOMDate
+					and ac.Eligible is not null
+					and ac.BillType = 'I'
+					and ac.TransType = 9	
+				
+					union all
+
+					--include all the direct bill paid commission on Agency Bill policies from the old system,
+					--going forward if something gets paid through Direct Bill and the policy switches to Agency Bill
+					--those values will still get caught above
+					select ac.*, 'OLD' as PayableRecType, 'Paid' as PayableStatus, NULL as DueCleared
+					from Accounting.dbo.AFSICommission ac (nolock)
+					where pd.policyid = ac.PolicyId
+					and ac.LOB = 'WC'
+					and cast(ac.StatementDate as date) &lt;= @EOMDate
+					--and ac.BillType = 'A'
+					and ac.Migrated = 1
+					and ac.Descr = 'Total PaidCom'	
+					and cast(ac.EnteredDateTime as date) &lt;= @EOMDate
+					) t		
+				
+								) dc
+
+outer apply (select min(c.[Collections Start Date]) as [Collections Start Date]
+				from (select ca.[Collections Start Date]
+						from Collections.dbo.CollCollections cc (nolock)
+						cross apply (select top 1 cast(cah.ActionDate as date) as [Collections Start Date]
+										from Collections.dbo.CollActionsHistory cah (nolock)
+										where cc.CollectionID = cah.CollectionID
+										order by cah.ActionHistoryID) ca
+
+						where pd.PolicyID = cc.PolicyID
+						and cc.LOB = 'WC') c
+						) col
+
+where pd.AgtId &lt;&gt; 47 --exclude test policies
+and pd.FirmID &lt;&gt; 75 --exclude Assigned Risk
+--change to include fully paid policies mid-term
+--and pd.Policy = 'WWC3304180'
+and 1 = case
+			--only exclude fully paid policies if it's past their expiration date
+			--@EOMDate &gt; p.DateExpiration
+			--	and 
+			--JKS - 4/10/2019 - per Kevin Mulhall, changing report to show all policies where the total paid does not completely pay off the policy vs only currently billed
+			when pd.BillType = 'I'
+				and isnull(inst.CurrentBilled, 0) - (isnull(a.TotalPaid, 0) + isnull(prev.DirectBillPaid, 0))  &lt;&gt; 0 then 1
+			when pd.BillType = 'A'
+				and (isnull(inst.CurrentBilled, 0) - round(inst.CurrentBilledPremBase * (pd.ComRate1/100), 2, 0)) - (isnull(a.CashPaid, 0) + (isnull(prev.DirectBillPaid, 0) - isnull(dc.DirectBillCommission, 0))) &lt;&gt; 0 then 1
+			when pd.BillType = 'I'
+				and isnull(inst.PolicyCost, 0) - (isnull(a.TotalPaid, 0) + isnull(prev.DirectBillPaid, 0))  &lt;&gt; 0 then 1
+			when pd.BillType = 'A'
+				and (isnull(inst.PolicyCost, 0) - round(inst.PremBase * (pd.ComRate1/100), 2, 0)) - (isnull(a.CashPaid, 0) + (isnull(prev.DirectBillPaid, 0) - isnull(dc.DirectBillCommission, 0))) &lt;&gt; 0 then 1
+			else 0
+		end
+
+--and inst.PolicyCost is not null
+and pd.DateEffective &lt;= @EOMDate
+and year(pd.DateEffective) &gt;= 2016
+--AND (@PrevEOMDate IS NULL OR pd.DateEffective &gt; @PrevEOMDate) WL Added and commented
+--2/4/2019 - JKS - per Susan Houston exclude BTIS and CNH agents
+--2/13/2019 - JKS - per Susan Houston exclude EPG agents
+--2/20/2019 - JKS - per Susan Houston exclude FirmIDs 30, 33, 77, 78, 80, 81, 64
+and pd.AgtId not in(17208, 17216, 17647, 49616, 49617, 49618, 78949, 78950, 17652)
+and pd.FirmID not in(30, 33, 77, 78, 80, 81, 64)
+and pd.agtid not in(27267, 49616, 49617, 49618, 56446, 56447, 155900)
+and pd.UwOfc not in(10, 20, 24, 26, 36)
+
+
+
+print('WC Policies pulled')
+
+
+--to speed up the report I'm grabbing all the records needed for the calculations as of the EOM Date of the report
+
+--getting all of the installment schedules for every non-test/Assigned Risk policy in the snapshot
+select pia.*, 
+DATEADD(DAY, 20, cast(pia.PremInvDate as date)) as DueDate,
+round((round(pia.PremInvAmt, 2, 0) - round(pia.TaxAmt, 2, 0) - round(pia.FeeAmt, 2, 0)) * (wp.ComRate1/100), 2, 0) as ExpectedComm
+into #WCPremInvAmts
+from #WCPolicies wp
+--inner join dbo.EOM_Premdat_PremInvAmts_4 pia (nolock)
+inner join Premdat.dbo.PremInvAmts pia (nolock)
+	on wp.PolicyID = pia.PolicyID
+--where pia.EOMDate = @EOMDate
+--drop table if exists #WCPremInvAmts
+print('WC PIA pulled')
+
+--adding Index to speed up the report
+CREATE NONCLUSTERED INDEX [IX_WCPremInvAmts_PolicyID] ON #WCPremInvAmts
+(
+	[PolicyID] ASC
+)
+INCLUDE ([PremInvAmt],
+		[PremAmt],
+		[TaxAmt],
+		[FeeAmt]) WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, SORT_IN_TEMPDB = OFF, DROP_EXISTING = OFF, ONLINE = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, FILLFACTOR = 80) ON [PRIMARY]
+
+print('WC PIA Index')
+
+
+--declare @EOMDate date = '9-13-2018'
+select wp.*, 
+isnull(isnull(db.TotBilled, ab.TotBilled), 0) as TotBilled, 
+isnull(isnull(db.T1, ab.T1), 0) as T1,
+isnull(isnull(db.T2, ab.T2), 0) as T2,
+isnull(isnull(db.T3, ab.T3), 0) as T3,
+isnull(isnull(db.T4, ab.t4), 0) as T4,
+isnull(isnull(db.T5, ab.T5), 0) as T5,
+isnull(isnull(db.T6, ab.T6), 0) as T6,
+isnull(db.LastDueDate, ab.LastDueDate) as LastDueDate,
+isnull(db.FirstInstallment, ab.FirstInstallment) as FirstInstallment,
+isnull(db.NumDays, ab.NumDays) as NumDays,
+isnull(isnull(db.TotBilled, ab.TotBilled), 0) - isnull(wp.TotPaid, 0) as CurrBalance
+into #WCAges
+from #WCPolicies wp
+--add in future installments
+outer apply (select sum(round(pia.PremInvAmt, 2, 0)) as TotBilled, 
+					sum(case
+							when cast(pia.PremInvDate as date) between DATEADD(d, -29, @EOMDate) and @EOMDate then round(pia.PremInvAmt, 2, 0)
+							else 0
+						end) as T1,
+					sum(case
+							when cast(pia.PremInvDate as date) between DATEADD(d, -59, @EOMDate) and DATEADD(d, -30, @EOMDate) then round(pia.PremInvAmt, 2, 0)
+							else 0
+						end) as T2,
+					sum(case
+							when cast(pia.PremInvDate as date) between DATEADD(d, -89, @EOMDate) and  DATEADD(d, -60, @EOMDate) then round(pia.PremInvAmt, 2, 0)
+							else 0
+						end) as T3,
+					sum(case
+							when cast(pia.PremInvDate as date) between DATEADD(d, -179, @EOMDate) and  DATEADD(d, -90, @EOMDate) then round(pia.PremInvAmt, 2, 0)
+							else 0
+						end) as T4,
+					sum(case
+							when cast(pia.PremInvDate as date) between DATEADD(d, -364, @EOMDate) and  DATEADD(d, -180, @EOMDate) then round(pia.PremInvAmt, 2, 0)
+							else 0
+						end) as T5,
+					sum(case
+							when cast(pia.PremInvDate as date) &lt;= DATEADD(d, -365, @EOMDate) then round(pia.PremInvAmt, 2, 0)
+							else 0
+						end) as T6,
+					max(pia.DueDate) as LastDueDate,
+					min(pia.PremInvDate) as FirstInstallment,
+					DATEDIFF(d, MIN(cast(pia.PremInvDate as date)), @EOMDate) as NumDays
+				from #WCPremInvAmts pia (nolock)
+				where wp.PolicyID = pia.PolicyID
+				and pia.PremInvDate &lt;= @EOMDate
+				AND (@PrevEOMDate IS NULL OR pia.PremInvDate &gt; @PrevEOMDate)
+				and wp.BillType = 'I'
+				) db
+outer apply (select sum(round(pia.PremInvAmt, 2, 0) - pia.ExpectedComm) as TotBilled, 
+					sum(case
+							when cast(pia.PremInvDate as date) between DATEADD(d, -29, @EOMDate) and @EOMDate then round(pia.PremInvAmt, 2, 0) - pia.ExpectedComm
+							else 0
+						end) as T1,
+					sum(case
+							when cast(pia.PremInvDate as date) between DATEADD(d, -59, @EOMDate) and DATEADD(d, -30, @EOMDate) then round(pia.PremInvAmt, 2, 0) - pia.ExpectedComm
+							else 0
+						end) as T2,
+					sum(case
+							when cast(pia.PremInvDate as date) between DATEADD(d, -89, @EOMDate) and  DATEADD(d, -60, @EOMDate) then round(pia.PremInvAmt, 2, 0) - pia.ExpectedComm
+							else 0
+						end) as T3,
+					sum(case
+							when cast(pia.PremInvDate as date) between DATEADD(d, -179, @EOMDate) and  DATEADD(d, -90, @EOMDate) then round(pia.PremInvAmt, 2, 0) - pia.ExpectedComm
+							else 0
+						end) as T4,
+					sum(case
+							when cast(pia.PremInvDate as date) between DATEADD(d, -364, @EOMDate) and  DATEADD(d, -180, @EOMDate) then round(pia.PremInvAmt, 2, 0) - pia.ExpectedComm
+							else 0
+						end) as T5,
+					sum(case
+							when cast(pia.PremInvDate as date) &lt;= DATEADD(d, -365, @EOMDate) then round(pia.PremInvAmt, 2, 0) - pia.ExpectedComm
+							else 0
+						end) as T6,
+					max(pia.DueDate) as LastDueDate,
+					min(pia.PremInvDate) as FirstInstallment,
+					DATEDIFF(d, MIN(cast(pia.PremInvDate as date)), @EOMDate) as NumDays
+				from #WCPremInvAmts pia (nolock)
+				where wp.PolicyID = pia.PolicyID
+				and pia.PremInvDate &lt;= @EOMDate
+				AND (@PrevEOMDate IS NULL OR pia.PremInvDate &gt; @PrevEOMDate)
+				and wp.BillType = 'A'
+				) ab
+--where isnull(db.FirstInstallment, ab.FirstInstallment) is not null
+
+
+print('WC Setup Ages')
+
+select a.*, 
+case
+	--when the billing nets to 0 but there's still an amount paid find the bucket for how old the credit is 
+	when a.TotBilled = 0 and a.TotPaid &lt;&gt; 0 and a.LastDueDate &lt;= DATEADD(d, -365, @EOMDate) then a.TotPaid * -1
+
+	--if amount paid = 0 then take whatever is in the bucket
+	when a.T6 &gt;= 0 and a.TotPaid = 0 then a.T6
+
+	--when the amount is greater than 0 and the total paid is less then the balance is the amount minus paid
+	when a.T6 &gt; 0
+		and a.T6 - a.TotPaid &gt;= 0 then a.T6 - a.TotPaid
+
+	--when paid is greater than the amount, the negative is the total balance, and no further activity then amount less total paid if the last due date was in that range
+	when a.T6 &gt;= 0 
+		and a.T6 - a.TotPaid &lt; 0 
+		and a.T6 - a.TotPaid = a.CurrBalance
+		and a.T5 = 0 
+		and a.T4 = 0 
+		and a.T3 = 0 
+		and a.T2 = 0 
+		and a.t1 = 0 
+		then a.T6 - a.TotPaid
+
+	--when paid is greater than or equal to the amount
+	when a.T6 &gt; 0 
+		and a.T6 - a.TotPaid &lt;= 0 
+		then 0
+
+	--if the current bucket is negative, but there's later activity, add the credit to the remaining paid to be used later
+	when a.T6 &lt; 0
+		and (a.T5 &lt;&gt; 0
+		or a.t4 &lt;&gt; 0
+		or a.T3 &lt;&gt; 0
+		or a.T2 &lt;&gt; 0 
+		or a.t1 &lt;&gt; 0) then 0
+
+	--when the amount is less than 0 take the amount minus the paid (value will offset later if there's a positive)
+	--only add the credit on the last bucket, otherwise the amount perpetuates through the buckets
+	--check if there is any activity in later buckets, if not, that's the bucket with the credit
+	when a.T6 &lt; 0 
+		and a.T5 = 0 
+		and a.T4 = 0 
+		and a.T3 = 0 
+		and a.T2 = 0 
+		and a.t1 = 0 then a.T6 - a.TotPaid
+
+	else 0
+end as [Over 365 Bal],
+case
+	--when the billing nets to 0 but there's still an amount paid find the bucket for how old the credit is 
+	when a.TotBilled = 0 and a.TotPaid &lt;&gt; 0 and a.LastDueDate &lt;= DATEADD(d, -365, @EOMDate) then 0
+
+	--when the amount is greater than 0 and the total paid is less the remaining paid is 0
+	when a.T6 &gt; 0 
+		and a.T6 - a.TotPaid &gt;= 0 
+		then 0
+
+	--if the bucket less the paid = current balance, use up all the money
+	when a.T6 &gt;= 0 
+		and a.T6 - a.TotPaid &lt; 0 
+		and a.T6 - a.TotPaid = a.CurrBalance
+		and a.T5 = 0 
+		and a.T4 = 0 
+		and a.T3 = 0 
+		and a.T2 = 0 
+		and a.t1 = 0 
+		then 0
+
+	--when paid is greater than the amount then reduce the paid by the amount for remaining
+	when a.T6 &gt; 0
+		and a.T6 - a.TotPaid &lt;= 0 
+		then a.TotPaid - a.T6
+
+	--when the amount is less than 0 put the whole paid towards the negative so remaining is 0
+	when a.T6 &lt; 0 
+		and a.T5 = 0 
+		and a.T4 = 0 
+		and a.T3 = 0 
+		and a.T2 = 0 
+		and a.t1 = 0 then 0
+
+	--if the current bucket is negative, but there's later activity, add the credit to the remaining paid to be used later
+	when a.T6 &lt; 0
+		and (a.T5 &lt;&gt; 0
+		or a.t4 &lt;&gt; 0
+		or a.T3 &lt;&gt; 0
+		or a.T2 &lt;&gt; 0 
+		or a.t1 &lt;&gt; 0) then a.TotPaid - a.T6
+
+	--no activity so carry the full paid forward
+	else a.TotPaid
+
+end Over365RemainingPaid
+into #WCOver365
+from #WCAges a
+
+
+print('WC Over 365')
+
+
+select t.*,
+case
+	--when the billing nets to 0 but there's still an amount paid find the bucket for how old the credit is 
+	when t.TotBilled = 0 and t.TotPaid &lt;&gt; 0 and t.LastDueDate  between DATEADD(d, -364, @EOMDate) and  DATEADD(d, -180, @EOMDate) then (t.Over365RemainingPaid - t.T5)  * -1
+
+	--if we already used the whole paid amount in the previous slice then the remainder is just the current slice
+	when t.T5 &gt;= 0 and t.Over365RemainingPaid = 0 then t.T5
+
+	--when the amount + the older slice's balance is greater than 0 and the total paid is less then the balance is the amount + the older slice's balance minus paid
+	when t.T5 &gt; 0 
+		and t.T5 - t.Over365RemainingPaid &gt;= 0 
+		then t.T5 - t.Over365RemainingPaid
+
+	--when paid is greater than the amount + the older slice's balance and the negative is the total balance then amount less total paid if the last due date was in that range
+	when t.T5 &gt;= 0
+		and t.T5 - t.Over365RemainingPaid &lt; 0 		
+		and t.T5 - t.Over365RemainingPaid = t.CurrBalance
+		and t.T4 = 0 
+		and t.T3 = 0
+		and t.T2 = 0 
+		and t.t1 = 0 
+		then t.T5 - t.Over365RemainingPaid
+
+	--when paid is greater than the amount + the older slice's balance then 0
+	when t.T5 &gt;= 0
+		and t.T5 - t.Over365RemainingPaid &lt; 0 
+		then 0
+
+	--if the current bucket is negative, but there's later activity, add the credit to the remaining paid to be used later
+	when t.T5 &lt; 0
+		and (t.t4 &lt;&gt; 0
+		or t.T3 &lt;&gt; 0
+		or t.T2 &lt;&gt; 0 
+		or t.t1 &lt;&gt; 0) then 0
+
+	--when the amount is less than 0 take the amount + the older slice's balance minus the paid (value will offset later if there's a positive)
+	--check if there is any activity in later buckets, if not, that's the bucket with the credit
+	when t.T5 &lt; 0 
+		and t.T4 = 0 
+		and t.T3 = 0 
+		and t.T2 = 0 
+		and t.t1 = 0 then t.T5 - t.Over365RemainingPaid
+
+	else 0
+
+end as [180 to 365 Bal],
+case
+	--when the billing nets to 0 but there's still an amount paid find the bucket for how old the credit is 
+	when t.TotBilled = 0 and t.TotPaid &lt;&gt; 0 and t.LastDueDate  between DATEADD(d, -364, @EOMDate) and  DATEADD(d, -180, @EOMDate) then 0
+
+	--when the amount + the older slice's balance is greater than 0 and the total paid is less the remaining paid is 0
+	when t.T5 &gt; 0
+		and t.T5 - t.Over365RemainingPaid &gt;= 0 
+		then 0
+
+	--if the bucket less the paid = current balance, use up all the money
+	when t.T5 &gt;= 0
+		and t.T5 - t.Over365RemainingPaid &lt; 0 		
+		and t.T5 - t.Over365RemainingPaid = t.CurrBalance
+		and t.T4 = 0 
+		and t.T3 = 0
+		and t.T2 = 0 
+		and t.t1 = 0 
+		then 0
+
+	--if paid is more than the bucket, but that negative is the current balance, put the whole amount into the bucket
+	when t.T5 &gt;= 0
+		and t.T5 - t.Over365RemainingPaid &lt; 0 		
+		and t.T5 - t.Over365RemainingPaid = t.CurrBalance
+		and t.T4 = 0 
+		and t.T3 = 0
+		and t.T2 = 0 
+		and t.t1 = 0 
+		then 0
+
+	--when paid is greater than the amount + the older slice's balance then reduce the paid by the amount + the older slice's balance for remaining
+	when t.T5 &gt;= 0
+		and t.T5 - t.Over365RemainingPaid &lt; 0 
+		then t.Over365RemainingPaid - T5
+
+	--when the amount + the older slice's balance is less than 0 put the whole paid towards the negative so remaining is 0
+	--only move to the balance on the last bucket, otherwise bring the remaining paid forward
+	when t.T5 &lt; 0 
+		and t.T4 = 0 
+		and t.T3 = 0 
+		and t.T2 = 0 
+		and t.t1 = 0 then 0
+
+	--if the current bucket is negative, but there's later activity, add the credit to the remaining paid to be used later
+	when t.T5 &lt; 0
+		and (t.t4 &lt;&gt; 0
+		or t.T3 &lt;&gt; 0
+		or t.T2 &lt;&gt; 0 
+		or t.t1 &lt;&gt; 0) then t.Over365RemainingPaid - t.T5
+
+	--no activity so carry the full paid forward
+	else t.Over365RemainingPaid
+
+end as [180 to 365 Paid]
+into #WC180To365Bal
+from #WCOver365 t
+
+print('WC 180 to 365')
+
+
+select t.*,
+case
+	--when the billing nets to 0 but there's still an amount paid find the bucket for how old the credit is 
+	when t.TotBilled = 0 and t.TotPaid &lt;&gt; 0 and t.LastDueDate  between DATEADD(d, -364, @EOMDate) and  DATEADD(d, -180, @EOMDate) then (t.[180 to 365 Paid] - t.T4) * -1
+
+	--if we already used the whole paid amount in the previous slice then the remainder is just the current slice
+	when t.T4 &gt;= 0 and  t.[180 to 365 Paid] = 0 then t.T4
+
+	--when the amount + the older slice's balance is greater than 0 and the total paid is less then the balance is the amount + the older slice's balance minus paid
+	when t.T4 &gt; 0 
+		and t.T4 - t.[180 to 365 Paid] &gt;= 0 
+		then t.T4 - t.[180 to 365 Paid]
+
+	--when paid is greater than the amount + the older slice's balance and the negative is the total balance then amount less total paid if the last due date was in that range
+	when t.T4 &gt;= 0
+		and t.T4 - t.[180 to 365 Paid] &lt; 0 		
+		and t.T4 - t.[180 to 365 Paid] = t.CurrBalance
+		and t.T3 = 0
+		and t.T2 = 0 
+		and t.t1 = 0 
+		then t.T4 - t.[180 to 365 Paid]
+
+	--when paid is greater than the amount + the older slice's balance then 0
+	when t.T4 &gt;= 0
+		and t.T4 - t.[180 to 365 Paid] &lt; 0 
+		then 0
+
+	--if the current bucket is negative, but there's later activity, add the credit to the remaining paid to be used later
+	when t.T4 &lt; 0
+		and (t.T3 &lt;&gt; 0
+		or t.T2 &lt;&gt; 0 
+		or t.t1 &lt;&gt; 0) then 0
+
+	--when the amount is less than 0 take the amount + the older slice's balance minus the paid (value will offset later if there's a positive)
+	--check if there is any activity in later buckets, if not, that's the bucket with the credit
+	when t.T4 &lt; 0 
+		and t.T3 = 0
+		and t.T2 = 0 
+		and t.t1 = 0 then t.T4 - t.[180 to 365 Paid]
+
+	else 0
+
+end as [90 to 180 Bal],
+case
+	--when the billing nets to 0 but there's still an amount paid find the bucket for how old the credit is 
+	when t.TotBilled = 0 and t.TotPaid &lt;&gt; 0 and t.LastDueDate  between DATEADD(d, -364, @EOMDate) and  DATEADD(d, -180, @EOMDate) then 0
+
+	--when the amount + the older slice's balance is greater than 0 and the total paid is less the remaining paid is 0
+	when t.T4 &gt; 0
+		and t.T4 - t.[180 to 365 Paid] &gt;= 0 
+		then 0
+
+	--if the bucket less the paid = current balance, use up all the money
+	when t.T4 &gt;= 0
+		and t.T4 - t.[180 to 365 Paid] &lt; 0 		
+		and t.T4 - t.[180 to 365 Paid] = t.CurrBalance
+		and t.T3 = 0
+		and t.T2 = 0 
+		and t.t1 = 0 
+		then 0
+
+	--if paid is more than the bucket, but that negative is the current balance, put the whole amount into the bucket
+	when t.T4 &gt;= 0
+		and t.T4 - t.[180 to 365 Paid] &lt; 0 		
+		and t.T4 - t.[180 to 365 Paid] = t.CurrBalance
+		and t.T3 = 0
+		and t.T2 = 0 
+		and t.t1 = 0 
+		then 0
+
+	--when paid is greater than the amount + the older slice's balance then reduce the paid by the amount + the older slice's balance for remaining
+	when t.T4 &gt;= 0
+		and t.T4 - t.[180 to 365 Paid] &lt; 0 
+		then t.[180 to 365 Paid] - T4
+
+	--when the amount + the older slice's balance is less than 0 put the whole paid towards the negative so remaining is 0
+	when t.T4 &lt; 0
+		and t.T3 = 0
+		and t.T2 = 0 
+		and t.t1 = 0 then 0
+
+	--if the current bucket is negative, but there's later activity, add the credit to the remaining paid to be used later
+	when t.T4 &lt; 0
+		and (t.T3 &lt;&gt; 0
+		or t.T2 &lt;&gt; 0 
+		or t.t1 &lt;&gt; 0) then t.[180 to 365 Paid] - t.T4
+
+	--no activity so carry the full paid forward
+	else t.[180 to 365 Paid]
+
+end as [90 to 180 Paid]
+into #WC90to180
+from #WC180To365Bal t
+
+print('WC 90 to 180')
+
+
+select t.*,
+case
+	--when the billing nets to 0 but there's still an amount paid find the bucket for how old the credit is 
+	when t.TotBilled = 0 and t.TotPaid &lt;&gt; 0 and t.LastDueDate  between DATEADD(d, -89, @EOMDate) and  DATEADD(d, -60, @EOMDate) then (t.[90 to 180 Paid] - t.T3) * -1
+
+	--if we already used the whole paid amount in the previous slice then the remainder is just the current slice
+	when t.T3 &gt;= 0 and  t.[90 to 180 Paid] = 0 then t.T3
+
+	--when the amount + the older slice's balance is greater than 0 and the total paid is less then the balance is the amount + the older slice's balance minus paid
+	when t.T3 &gt; 0 
+		and  t.T3 - t.[90 to 180 Paid] &gt;= 0 
+		then t.T3 - t.[90 to 180 Paid]
+
+	--when paid is greater than the amount + the older slice's balance and the negative is the total balance then amount less total paid if the last due date was in that range
+	when t.T3 &gt;= 0
+		and t.T3 - t.[90 to 180 Paid] &lt; 0 		
+		and t.T3 - t.[90 to 180 Paid] = t.CurrBalance
+		and t.T2 = 0 
+		and t.t1 = 0 
+		then t.T3 - t.[90 to 180 Paid]
+
+	--when paid is greater than the amount + the older slice's balance then 0
+	when t.T3 &gt;= 0
+		and t.T3 - t.[90 to 180 Paid] &lt; 0 
+		then 0
+
+	--if the current bucket is negative, but there's later activity, add the credit to the remaining paid to be used later
+	when t.T3 &lt; 0
+		and (t.T2 &lt;&gt; 0 
+		or t.t1 &lt;&gt; 0) then 0
+
+	--when the amount is less than 0 take the amount + the older slice's balance minus the paid (value will offset later if there's a positive)
+	when t.T3 &lt; 0
+		and t.T2 = 0 
+		and t.t1 = 0 then t.T3 - t.[90 to 180 Paid]
+
+	else 0
+
+end as [60 to 90 Bal],
+case
+	--when the billing nets to 0 but there's still an amount paid find the bucket for how old the credit is 
+	when t.TotBilled = 0 and t.TotPaid &lt;&gt; 0 and t.LastDueDate  between DATEADD(d, -89, @EOMDate) and  DATEADD(d, -60, @EOMDate) then 0
+
+	--when the amount + the older slice's balance is greater than 0 and the total paid is less the remaining paid is 0
+	when t.T3 &gt; 0
+		and t.T3 - t.[90 to 180 Paid] &gt;= 0 
+		then 0
+
+	--if the bucket less the paid = current balance, use up all the money
+	when t.T3 &gt;= 0
+		and t.T3 - t.[90 to 180 Paid] &lt; 0 		
+		and t.T3 - t.[90 to 180 Paid] = t.CurrBalance
+		and t.T2 = 0 
+		and t.t1 = 0 
+		then 0
+
+	--if paid is more than the bucket, but that negative is the current balance, put the whole amount into the bucket
+	when t.T3 &gt;= 0
+		and t.T3 - t.[90 to 180 Paid] &lt; 0 		
+		and t.T3 - t.[90 to 180 Paid] = t.CurrBalance
+		and t.T2 = 0 
+		and t.t1 = 0 
+		then 0
+
+	--when paid is greater than the amount + the older slice's balance then reduce the paid by the amount + the older slice's balance for remaining
+	when t.T3 &gt;= 0
+		and t.T3 - t.[90 to 180 Paid] &lt; 0 
+		then t.[90 to 180 Paid] - T3
+
+	--when the amount + the older slice's balance is less than 0 put the whole paid towards the negative so remaining is 0
+	when t.T3 &lt; 0
+		and t.T2 = 0 
+		and t.t1 = 0 
+		then 0
+
+	--if the current bucket is negative, but there's later activity, add the credit to the remaining paid to be used later
+	when t.T3 &lt; 0
+		and (t.T2 &lt;&gt; 0 
+		or t.t1 &lt;&gt; 0) then t.[90 to 180 Paid] - t.T3
+
+	--no activity so carry the full paid forward
+	else t.[90 to 180 Paid]
+
+end as [60 to 90 Paid]
+into #WC60To90Bal
+from #WC90to180 t
+
+print('WC 60 to 90')
+
+select t.*,
+case
+	--when the billing nets to 0 but there's still an amount paid find the bucket for how old the credit is 
+	when t.TotBilled = 0 and t.TotPaid &lt;&gt; 0 and t.LastDueDate  between DATEADD(d, -59, @EOMDate) and DATEADD(d, -30, @EOMDate) then (t.[60 to 90 Paid] - t.T2) * -1
+
+	--if we already used the whole paid amount in the previous slice then the remainder is just the current slice
+	when t.T2 &gt;= 0 and t.[60 to 90 Paid] = 0 then t.T2
+
+	--when the amount + the older slice's balance is greater than 0 and the total paid is less then the balance is the amount + the older slice's balance minus paid
+	when t.T2 &gt; 0 
+		and  t.T2 - t.[60 to 90 Paid] &gt;= 0 
+		then t.T2 - t.[60 to 90 Paid]
+
+	--when paid is greater than the amount + the older slice's balance and the negative is the total balance then amount less total paid
+	when t.T2 &gt;= 0
+		and t.T2 - t.[60 to 90 Paid] &lt; 0 
+		and t.T2 - t.[60 to 90 Paid] = t.CurrBalance
+		and t.T1 = 0
+		then t.T2 - t.[60 to 90 Paid]
+
+	when t.T2 &gt;= 0
+		and t.T2 - t.[60 to 90 Paid] &lt; 0 
+		then 0
+
+	--if the current bucket is negative, but there's later activity, add the credit to the remaining paid to be used later
+	when t.T2 &lt; 0
+		and t.t1 &lt;&gt; 0 then 0
+
+	--when the amount is less than 0 take the amount + the older slice's balance minus the paid (value will offset later if there's a positive)
+	when t.T2 &lt; 0
+		and t.T1 = 0 
+		then t.T2 - t.[60 to 90 Paid]
+
+	else 0
+
+end as [30 to 60 Bal],
+case
+	--when the billing nets to 0 but there's still an amount paid find the bucket for how old the credit is 
+	when t.TotBilled = 0 and t.TotPaid &lt;&gt; 0 and t.LastDueDate  between DATEADD(d, -59, @EOMDate) and DATEADD(d, -30, @EOMDate) then 0
+
+	--when the amount + the older slice's balance is greater than 0 and the total paid is less the remaining paid is 0
+	when t.T2 &gt; 0
+		and t.T2 - t.[60 to 90 Paid] &gt;= 0 
+		then 0
+
+	--if the bucket less the paid = current balance, use up all the money
+	when t.T2 &gt; 0 
+		and  t.T2 - t.[60 to 90 Paid] &gt;= 0 
+		then 0
+
+	--if paid is more than the bucket, but that negative is the current balance, put the whole amount into the bucket
+	when t.T2 &gt;= 0
+		and t.T2 - t.[60 to 90 Paid] &lt; 0 
+		and t.T2 - t.[60 to 90 Paid] = t.CurrBalance
+		and t.T1 = 0
+		then 0
+
+	--when paid is greater than the amount + the older slice's balance then reduce the paid by the amount + the older slice's balance for remaining
+	when t.T2 &gt;= 0
+		and t.T2 - t.[60 to 90 Paid] &lt; 0 
+		then t.[60 to 90 Paid] - T2
+
+	--when the amount + the older slice's balance is less than 0 put the whole paid towards the negative so remaining is 0
+	when t.T2 &lt; 0
+		and t.T1 = 0 
+		then 0
+
+	--if the current bucket is negative, but there's later activity, add the credit to the remaining paid to be used later
+	when t.T2 &lt; 0
+		and t.t1 &lt;&gt; 0 then t.[60 to 90 Paid] - t.T2
+
+	--no activity so carry the full paid forward
+	else t.[60 to 90 Paid]
+
+end as [30 to 60 Paid]
+into #WC30To60Bal
+from #WC60To90Bal t
+
+print('WC 30 to 60')
+
+select t.*,
+--no matter what, use up on the remaining money on the newest bucket, can't leave money in paid
+t.T1 - t.[30 to 60 Paid] as [0 to 30 Bal],
+0 as [0 to 30 Paid]
+into #WC0To30Bal
+from #WC30To60Bal t
+
+print('WC 0 to 30')
+
+
+-----------------------------------------------------CPP---------------------------------------------------
+--declare @EOMDate date = '12-31-2018'
+--Get all of the information besides the amounts
+select pd.PolicyID, 
+cast(getdate() as date) as ReportDate, 
+p.FirmID, 
+p.AgtId,
+p.AgtGroup,
+ag.UwOfc,
+'CPP' as LOB,
+p.Policy + '-' + p.PolicySuffix as Policy,
+p.DateEffective,
+p.DateExpiration,
+pd.AuditDate,
+pd.DateCanc,
+pp.BillType,
+p.ProductType,
+p.NoRefund,
+p.DoNotInvoice,
+p.DoNotInvoiceAfterAudit,
+col.[Collections Start Date],
+inst.TotalTax,
+inst.TotalFee,
+inst.BilledTax,
+inst.BilledFee,
+case
+	when pp.BillType = 'A' then (isnull(inst.FutureDue, 0) - round((inst.FutureDue - inst.FutureTax - inst.FutureFee) * (pd.ComRate/100), 2, 0))
+	else isnull(inst.FutureDue, 0)
+end as FutureDue,
+cb.Exist as Bankruptcy, 
+pd.ComRate,
+--2/4/2019 - JKS - per Susan Houston, when reporting Agency Bill the Policy Cost should be Policy Cost less Expected Commissions
+case
+	when pp.BillType = 'A' then (isnull(inst.PolicyCost, 0) - round(inst.PremBase * (pd.ComRate/100), 2, 0)) 
+	else isnull(inst.PolicyCost, 0)
+end as PolicyCost,
+--2/4/2019 - JKS - per Susan Houston, if a policy is on Agency Bill we only want to show the balance of the expected net (Policy Cost - Taxes - Fees - Expected Kept Commission) - Net Payment remitted from Agent
+case
+	when pp.BillType = 'A' then isnull(a.CashPaid, 0) + (isnull(prev.DirectBillPaid, 0) - isnull(dc.DirectBillCommission, 0))
+	else isnull(a.TotalPaid, 0) + isnull(prev.DirectBillPaid, 0)
+end	as TotPaid,
+--2/4/2019 - JKS - per Susan Houston, when reporting Agency Bill the overall balance should be the Policy Cost less Expected Commissions less Net Payment remitted from Agent
+case
+	when pp.BillType = 'A' then (isnull(inst.PolicyCost, 0) - round(inst.PremBase * (pd.ComRate/100), 2, 0)) - (isnull(a.CashPaid, 0) + (isnull(prev.DirectBillPaid, 0) - isnull(dc.DirectBillCommission, 0)))
+	else isnull(inst.PolicyCost, 0) - (isnull(a.TotalPaid, 0) + isnull(prev.DirectBillPaid, 0)) 
+end as Balance
+
+
+into #CPPPolicies
+--declare @EOMDate date = '9-13-2018'
+--select count(*)
+from CPP.dbo.CPPPolicyCore p (nolock)
+cross apply (select top 1 sd.PolicyID, sd.DateEffective, sd.ComRate, sd.PmtPlan, eh.AuditDate, sd.DateCanc
+				from CPP.dbo.CPPPolicySubData sd (nolock)
+				inner join CPP.dbo.CPPPolicyEndmtHistory eh (nolock)
+						on sd.PolicyID = eh.PolicyID
+						and sd.EndmtNum = eh.EndmtNum 
+						and cast(eh.DateProcessed as date) &lt;= @EOMDate
+						AND (@PrevEOMDate IS NULL OR cast(eh.DateProcessed as date) &gt; @PrevEOMDate)
+				where p.policyid = sd.policyid
+				order by sd.EndmtNum desc) pd
+left join CPP.dbo.PaymentPlans pp (nolock)
+	on pd.PmtPlan = pp.PPID
+inner join Premdat.dbo.AgtGroup ag (nolock)
+	on p.AgtGroup = ag.AgtGroup
+outer apply (select sum(round(pia.PremInvAmt, 2, 0)) as PolicyCost, sum(round(pia.PremInvAmt, 2, 0) - round(pia.TaxAmt, 2, 0) - round(pia.FeeAmt, 2, 0)) as PremBase,
+				sum(case
+						when cast(pia.PremInvDate as date) &lt;= @EOMDate AND (@PrevEOMDate IS NULL OR cast(pia.PremInvDate as date) &gt; @PrevEOMDate )
+						then round(pia.PremInvAmt, 2, 0)
+						else 0
+					end) as CurrentBilled,
+				sum(case
+						when cast(pia.PremInvDate as date) &lt;= @EOMDate AND (@PrevEOMDate IS NULL OR cast(pia.PremInvDate as date) &gt; @PrevEOMDate )
+						then round(pia.PremInvAmt, 2, 0) - round(pia.TaxAmt, 2, 0) - round(pia.FeeAmt, 2, 0)
+						else 0
+					end) as CurrentBilledPremBase,
+				sum(round(pia.TaxAmt, 2, 0)) as TotalTax,
+				sum(round(pia.FeeAmt, 2, 0)) as TotalFee,
+				sum(case
+						when cast(pia.PremInvDate as date) &lt;= @EOMDate AND (@PrevEOMDate IS NULL OR cast(pia.PremInvDate as date) &gt; @PrevEOMDate )
+						then round(pia.TaxAmt, 2, 0)
+						else 0
+					end) as BilledTax,
+				sum(case
+						when cast(pia.PremInvDate as date) &lt;= @EOMDate AND (@PrevEOMDate IS NULL OR cast(pia.PremInvDate as date) &gt; @PrevEOMDate )
+						then round(pia.FeeAmt, 2, 0)
+						else 0
+					end) as BilledFee,
+				sum(case
+						when cast(pia.PremInvDate as date) &gt; @EOMDate 
+						then round(pia.PremInvAmt, 2, 0)
+						else 0
+					end) as FutureDue,
+				sum(case
+						when cast(pia.PremInvDate as date) &gt; @EOMDate
+						then round(pia.TaxAmt, 2, 0)
+						else 0
+					end) as FutureTax,
+				sum(case
+						when cast(pia.PremInvDate as date) &gt; @EOMDate AND (@PrevEOMDate IS NULL OR cast(pia.PremInvDate as date) &gt; @PrevEOMDate )
+						then round(pia.FeeAmt, 2, 0)
+						else 0
+					end) as FutureFee
+				--from dbo.EOM_CPP_PremInvAmts_4 pia (nolock)
+				from CPP.dbo.PremInvAmts pia (nolock)
+				where pd.PolicyID = pia.PolicyID) inst
+
+--split out the full paid vs cash paid for Agency Bill
+--age Agency Bill based on expected net amount to net receive from the agent
+--policy that switched from Direct to Agency and had Direct payments we need to reduce the paid by insured amount by the commission paid 
+--to make sure that we're using the same basis for all payments
+
+--Agency Bill Payments
+outer apply (select sum(round(isnull(ar.PaidPrem, 0), 2, 0)) as TotalPaid, 
+				sum(round(isnull(case
+									when ar.PaidCom &lt;&gt; 0
+										and isnull(ar.BordereauItem, 0) = 0 then round(ar.PaidPrem, 2, 0) - round(ar.PaidCom, 2, 0)
+										else round(ar.CashPaid, 2, 0)
+									end, 0), 2, 0)) as CashPaid
+				--from dbo.EOM_CPP_AcctRec_4 ar (nolock)
+				from CPP.dbo.AcctRec ar (nolock)
+				where pd.PolicyID = ar.PolicyID
+				and ar.TransType &lt;&gt; 9
+				--and ar.EnteredBy &lt;&gt; 'FNPImport'
+				and 1 = case
+							when isnull(ar.BordereauItem, 0) &gt; 0 
+								and isnull(ar.CashLibIndex, 0) = 0 
+								and  ar.PaidCom &lt;&gt; 0 then 1
+							when ar.PaidCom &lt;&gt; 0 
+								and isnull(ar.BordereauItem, 0) = 0
+								and pp.BillType = 'A' then 1
+							else 0
+						end
+				) a
+
+--Direct Bill Payments
+outer apply (select sum(round(isnull(ar.PaidPrem, 0), 2, 0)) as DirectBillPaid
+				--from dbo.EOM_CPP_AcctRec_4 ar (nolock)
+				from CPP.dbo.AcctRec ar (nolock)
+				where pd.PolicyID = ar.PolicyID
+				and ar.TransType &lt;&gt; 9
+				--and ar.EnteredBy &lt;&gt; 'FNPImport'
+				and 1 = case
+							when isnull(ar.BordereauItem, 0) &gt; 0 
+								and isnull(ar.CashLibIndex, 0) = 0 
+								and  ar.PaidCom &lt;&gt; 0 then 0
+							when ar.PaidCom &lt;&gt; 0 
+								and isnull(ar.BordereauItem, 0) = 0
+								and pp.BillType = 'A' then 0
+							else 1
+						end
+				) prev
+
+--outer apply (select sum(round(ac.Paid, 2, 0)) as DirectBillCommission
+--				--from dbo.EOM_CPP_AgtCommission_4 ac (nolock)
+--				from CPP.dbo.AgtCommission ac (nolock)
+--				where pd.PolicyID = ac.PolicyId
+--				and ac.TransType = 4) dc
+outer apply (select sum(case
+							--anything that's not an Amount DUE to us from the Agent needs to be in a Paid Status to be included in the Direct Bill Commission Paid
+							when t.RecType &lt;&gt; 'DUE' 
+								and t.PayableStatus = 'Paid' then t.CommAmt
+						
+							--if the net of an Agent's statement is negative and they owe us, only include the credit until it is cleared off 
+							when t.PayableRecType = 'DUE'
+								and isnull(t.DueCleared, 0) = 0 then t.CommAmt
+							else 0
+						end) as DirectBillCommission
+				from 
+					(select ac.*, p.RecType as PayableRecType, s.PayableStatus, ds.DueCleared
+					from Accounting.dbo.AFSICommission ac (nolock)
+					inner join Accounting.dbo.Payables p (nolock)
+						on ac.MasterAgtID = p.ParentID
+						and p.ParentType = 5 --Agent
+						and ac.PayableID = p.PayableID
+						and ac.Eligible = p.StatementDate
+						and cast(p.EnteredDateTime as date) &lt;= @EOMDate
+					--to get the status of whether a given amount has actually been paid we need to find the latest roll-up record
+					--the type of the latest record tells us whether the money is still on the Agent's account or has been sent out
+					cross apply (select top 1 case
+												when p2.RecType in('CPMT', 'EPMT', 'CREIS', 'EREIS', 'CSGL', 'ECHT') then 'Paid' --BConnolly - Added outgoing escheatments to the paid status
+												when p2.RecType in('CPBL', 'CRTN', 'ERTN', 'VOID', 'STOP', 'SECHT', 'VECHT') then 'Outstanding'
+												when p2.RecType = 'DUE' then 'DUE'
+												else 'Unknown'
+											end as PayableStatus
+									from Accounting.dbo.Payables p2 (nolock)
+									where p.ParentID = p2.ParentID
+									and p.ParentType = p2.ParentType
+									and cast(p2.EnteredDateTime as date) &lt;= @EOMDate
+									and p2.TransType = 4 --BConnolly - For stops I'm making sure the transtype of the stop record matches the record of the check being stopped. So if we stop a bonus/profit (transtype 14) those stops will not pull here. 
+									and cast(p.PayableID as varchar(30)) = JSON_VALUE(p2.SupportingInfo, '$.ORIGPAYABLEID')
+									order by p2.PayableID desc) s
+					--if the original Payable was a DUE amount we need to check to see if there's been any positive activity
+					--on the agent after the DUE amount was incurred,
+					--the only way for an agent to have a positive TransType 4 is their statement's activity has to take them above
+					--the threshold, once a DUE amount has been cleared it's no longer outstanding
+					outer apply (select distinct 1 as DueCleared
+									from Accounting.dbo.Payables p3 (nolock)
+									where p.ParentID = p3.ParentID
+									and p.ParentType = p3.ParentType
+									and cast(p3.EnteredDateTime as date) &lt;= @EOMDate
+									and p3.EnteredDateTime &gt; p.EnteredDateTime
+									and p.RecType = 'DUE'
+									and p3.TransType = 4
+									and p3.StatementAmt &gt; 0) ds
+					where pd.policyid = ac.PolicyId
+					and ac.LOB = 'CPP'
+					and cast(ac.StatementDate as date) &lt;= @EOMDate
+					and ac.Eligible is not null
+					and ac.BillType = 'I'
+					and ac.TransType = 9	
+					
+					union all
+
+					--include all the direct bill paid commission on Agency Bill policies from the old system,
+					--going forward if something gets paid through Direct Bill and the policy switches to Agency Bill
+					--those values will still get caught above
+					select ac.*, 'OLD' as PayableRecType, 'Paid' as PayableStatus, NULL as DueCleared
+					from Accounting.dbo.AFSICommission ac (nolock)
+					where pd.policyid = ac.PolicyId
+					and ac.LOB = 'CPP'
+					and cast(ac.StatementDate as date) &lt;= @EOMDate
+					--and ac.BillType = 'A'
+					and ac.Migrated = 1
+					and ac.Descr = 'Total PaidCom'	
+					and cast(ac.EnteredDateTime as date) &lt;= @EOMDate
+					) t		
+							
+				
+								) dc
+
+outer apply (select min(c.[Collections Start Date]) as [Collections Start Date]
+				from (select ca.[Collections Start Date]
+						from Collections.dbo.CollCollections cc (nolock)
+						cross apply (select top 1 cast(cah.ActionDate as date) as [Collections Start Date]
+										from Collections.dbo.CollActionsHistory cah (nolock)
+										where cc.CollectionID = cah.CollectionID
+										order by cah.ActionHistoryID) ca
+
+						where pd.PolicyID = cc.PolicyID
+						and cc.LOB = 'CPP') c
+						) col
+
+outer apply (select distinct 1 as Exist
+				from Accounting.dbo.Bankruptcy b (nolock)
+				where p.PolicyID = b.BindValue
+				and b.Product = 'CPP') cb
+
+where p.AgtID &lt;&gt; 47 --exclude test policies
+--AND p.Policy = 'WWC3304180'
+and 1 = case
+			--only exclude fully paid policies if it's past their expiration date
+			--@EOMDate &gt; p.DateExpiration
+			--	and 
+			--JKS - 4/10/2019 - per Kevin Mulhall, changing report to show all policies where the total paid does not completely pay off the policy vs only currently billed
+			when pp.BillType = 'I'
+				and isnull(inst.CurrentBilled, 0) - (isnull(a.TotalPaid, 0) + isnull(prev.DirectBillPaid, 0))  &lt;&gt; 0 then 1
+			when pp.BillType = 'A'
+				and (isnull(inst.CurrentBilled, 0) - round(inst.CurrentBilledPremBase * (pd.ComRate/100), 2, 0)) - (isnull(a.CashPaid, 0) + (isnull(prev.DirectBillPaid, 0) - isnull(dc.DirectBillCommission, 0))) &lt;&gt; 0 then 1
+			when pp.BillType = 'I'
+				and isnull(inst.PolicyCost, 0) - (isnull(a.TotalPaid, 0) + isnull(prev.DirectBillPaid, 0))  &lt;&gt; 0 then 1
+			when pp.BillType = 'A'
+				and (isnull(inst.PolicyCost, 0) - round(inst.PremBase * (pd.ComRate/100), 2, 0)) - (isnull(a.CashPaid, 0) + (isnull(prev.DirectBillPaid, 0) - isnull(dc.DirectBillCommission, 0))) &lt;&gt; 0 then 1
+			else 0
+		end
+
+--and inst.PolicyCost is not null
+and p.DateEffective &lt;= @EOMDate
+and year(p.DateEffective) &gt;= 2016
+--AND (@PrevEOMDate IS NULL OR p.DateEffective &gt; @PrevEOMDate ) WL ADDED and THEN COMMENTED
+--2/4/2019 - JKS - per Susan Houston exclude BTIS and CNH agents
+--2/13/2019 - JKS - per Susan Houston exclude EPG agents
+--2/20/2019 - JKS - per Susan Houston exclude FirmIDs 30, 33, 77, 78, 80, 81, 64
+--and p.AgtId not in(17208, 17216, 17647, 49616, 49617, 49618, 78949, 78950, 17652)
+--and p.FirmID not in(30, 33, 77, 78, 80, 81, 64)
+and p.agtid not in(27267, 49616, 49617, 49618, 56446, 56447, 155900, 78949, 78950)
+and ag.UwOfc not in(10, 20, 24, 26, 36)
+
+
+print('CPP Policies Index')
+
+
+--to speed up the report I'm grabbing all the records needed for the calculations as of the EOM Date of the report
+
+--getting all of the installment schedules for every non-test/Assigned Risk policy in the snapshot
+select pia.*, DATEADD(DAY, 20, cast(pia.PremInvDate as date)) as DueDate, round((round(pia.PremInvAmt, 2, 0) - round(pia.TaxAmt, 2, 0) - round(pia.FeeAmt, 2, 0)) * (cp.ComRate/100), 2, 0) as ExpectedComm
+into #CPPPremInvAmts
+from #CPPPolicies cp
+--inner join dbo.EOM_CPP_PremInvAmts_4 pia (nolock)
+inner join [CPP].[dbo].[PremInvAmts] pia (nolock)
+	on cp.PolicyID = pia.PolicyID
+
+print('CPP PIA Pulled')
+
+
+--adding Index to speed up the report
+CREATE NONCLUSTERED INDEX [IX_CPPPremInvAmts_PolicyID] ON #CPPPremInvAmts
+(
+	[PolicyID] ASC
+)
+INCLUDE ([PremInvAmt],
+		[PremAmt],
+		[TaxAmt],
+		[FeeAmt]) WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, SORT_IN_TEMPDB = OFF, DROP_EXISTING = OFF, ONLINE = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, FILLFACTOR = 80) ON [PRIMARY]
+
+print('CPP PIA Index')
+
+
+--declare @EOMDate date = '1-31-2019'
+select wp.*, 
+isnull(isnull(db.TotBilled, ab.TotBilled), 0) as TotBilled, 
+isnull(isnull(db.T1, ab.T1), 0) as T1,
+isnull(isnull(db.T2, ab.T2), 0) as T2,
+isnull(isnull(db.T3, ab.T3), 0) as T3,
+isnull(isnull(db.T4, ab.t4), 0) as T4,
+isnull(isnull(db.T5, ab.T5), 0) as T5,
+isnull(isnull(db.T6, ab.T6), 0) as T6,
+isnull(db.LastDueDate, ab.LastDueDate) as LastDueDate,
+isnull(db.FirstInstallment, ab.FirstInstallment) as FirstInstallment,
+isnull(db.NumDays, ab.NumDays) as NumDays,
+isnull(isnull(db.TotBilled, ab.TotBilled), 0) - isnull(wp.TotPaid, 0) as CurrBalance
+into #CPPAges
+----declare @EOMDate date = '1-31-2019'
+--select *
+from #CPPPolicies wp
+outer apply (select sum(round(pia.PremInvAmt, 2, 0)) as TotBilled, 
+					sum(case
+							when cast(pia.PremInvDate as date) between DATEADD(d, -29, @EOMDate) and @EOMDate then round(pia.PremInvAmt, 2, 0)
+							else 0
+						end) as T1,
+					sum(case
+							when cast(pia.PremInvDate as date) between DATEADD(d, -59, @EOMDate) and DATEADD(d, -30, @EOMDate) then round(pia.PremInvAmt, 2, 0)
+							else 0
+						end) as T2,
+					sum(case
+							when cast(pia.PremInvDate as date) between DATEADD(d, -89, @EOMDate) and  DATEADD(d, -60, @EOMDate) then round(pia.PremInvAmt, 2, 0)
+							else 0
+						end) as T3,
+					sum(case
+							when cast(pia.PremInvDate as date) between DATEADD(d, -179, @EOMDate) and  DATEADD(d, -90, @EOMDate) then round(pia.PremInvAmt, 2, 0)
+							else 0
+						end) as T4,
+					sum(case
+							when cast(pia.PremInvDate as date) between DATEADD(d, -364, @EOMDate) and  DATEADD(d, -180, @EOMDate) then round(pia.PremInvAmt, 2, 0)
+							else 0
+						end) as T5,
+					sum(case
+							when cast(pia.PremInvDate as date) &lt;= DATEADD(d, -365, @EOMDate) then round(pia.PremInvAmt, 2, 0)
+							else 0
+						end) as T6,
+					max(pia.DueDate) as LastDueDate,
+					min(pia.PremInvDate) as FirstInstallment,
+					DATEDIFF(d, MIN(cast(pia.PremInvDate as date)), @EOMDate) as NumDays
+				from #CPPPremInvAmts pia (nolock)
+				where wp.PolicyID = pia.PolicyID
+				and pia.PremInvDate &lt;= @EOMDate
+				AND (@PrevEOMDate IS NULL OR pia.PremInvDate &gt; @PrevEOMDate)
+				and wp.BillType = 'I'
+				) db
+outer apply (select sum(round(pia.PremInvAmt, 2, 0) - pia.ExpectedComm) as TotBilled, 
+					sum(case
+							when cast(pia.PremInvDate as date) between DATEADD(d, -29, @EOMDate) and @EOMDate then round(pia.PremInvAmt, 2, 0) - pia.ExpectedComm
+							else 0
+						end) as T1,
+					sum(case
+							when cast(pia.PremInvDate as date) between DATEADD(d, -59, @EOMDate) and DATEADD(d, -30, @EOMDate) then round(pia.PremInvAmt, 2, 0) - pia.ExpectedComm
+							else 0
+						end) as T2,
+					sum(case
+							when cast(pia.PremInvDate as date) between DATEADD(d, -89, @EOMDate) and  DATEADD(d, -60, @EOMDate) then round(pia.PremInvAmt, 2, 0) - pia.ExpectedComm
+							else 0
+						end) as T3,
+					sum(case
+							when cast(pia.PremInvDate as date) between DATEADD(d, -179, @EOMDate) and  DATEADD(d, -90, @EOMDate) then round(pia.PremInvAmt, 2, 0) - pia.ExpectedComm
+							else 0
+						end) as T4,
+					sum(case
+							when cast(pia.PremInvDate as date) between DATEADD(d, -364, @EOMDate) and  DATEADD(d, -180, @EOMDate) then round(pia.PremInvAmt, 2, 0) - pia.ExpectedComm
+							else 0
+						end) as T5,
+					sum(case
+							when cast(pia.PremInvDate as date) &lt;= DATEADD(d, -365, @EOMDate) then round(pia.PremInvAmt, 2, 0) - pia.ExpectedComm
+							else 0
+						end) as T6,
+					max(pia.DueDate) as LastDueDate,
+					min(pia.PremInvDate) as FirstInstallment,
+					DATEDIFF(d, MIN(cast(pia.PremInvDate as date)), @EOMDate) as NumDays
+				from #CPPPremInvAmts pia (nolock)
+				where wp.PolicyID = pia.PolicyID
+				and pia.PremInvDate &lt;= @EOMDate
+				AND (@PrevEOMDate IS NULL OR pia.PremInvDate &gt; @PrevEOMDate)
+				and wp.BillType = 'A'
+				) ab
+--where isnull(db.FirstInstallment, ab.FirstInstallment) is not null
+
+
+
+print('CPP Ages')
+
+select a.*, 
+case
+	--when the billing nets to 0 but there's still an amount paid find the bucket for how old the credit is 
+	when a.TotBilled = 0 and a.TotPaid &lt;&gt; 0 and a.LastDueDate &lt;= DATEADD(d, -365, @EOMDate) then a.TotPaid * -1
+
+	--if amount paid = 0 then take whatever is in the bucket
+	when a.T6 &gt;= 0 and a.TotPaid = 0 then a.T6
+
+	--when the amount is greater than 0 and the total paid is less then the balance is the amount minus paid
+	when a.T6 &gt; 0
+		and a.T6 - a.TotPaid &gt;= 0 then a.T6 - a.TotPaid
+
+	--when paid is greater than the amount, the negative is the total balance, and no further activity then amount less total paid if the last due date was in that range
+	when a.T6 &gt;= 0 
+		and a.T6 - a.TotPaid &lt; 0 
+		and a.T6 - a.TotPaid = a.CurrBalance
+		and a.T5 = 0 
+		and a.T4 = 0 
+		and a.T3 = 0 
+		and a.T2 = 0 
+		and a.t1 = 0 
+		then a.T6 - a.TotPaid
+
+	--when paid is greater than or equal to the amount
+	when a.T6 &gt; 0 
+		and a.T6 - a.TotPaid &lt;= 0 
+		then 0
+
+	--if the current bucket is negative, but there's later activity, add the credit to the remaining paid to be used later
+	when a.T6 &lt; 0
+		and (a.T5 &lt;&gt; 0
+		or a.t4 &lt;&gt; 0
+		or a.T3 &lt;&gt; 0
+		or a.T2 &lt;&gt; 0 
+		or a.t1 &lt;&gt; 0) then 0
+
+	--when the amount is less than 0 take the amount minus the paid (value will offset later if there's a positive)
+	--only add the credit on the last bucket, otherwise the amount perpetuates through the buckets
+	--check if there is any activity in later buckets, if not, that's the bucket with the credit
+	when a.T6 &lt; 0 
+		and a.T5 = 0 
+		and a.T4 = 0 
+		and a.T3 = 0 
+		and a.T2 = 0 
+		and a.t1 = 0 then a.T6 - a.TotPaid
+
+	else 0
+end as [Over 365 Bal],
+case
+	--when the billing nets to 0 but there's still an amount paid find the bucket for how old the credit is 
+	when a.TotBilled = 0 and a.TotPaid &lt;&gt; 0 and a.LastDueDate &lt;= DATEADD(d, -365, @EOMDate) then 0
+
+	--when the amount is greater than 0 and the total paid is less the remaining paid is 0
+	when a.T6 &gt; 0 
+		and a.T6 - a.TotPaid &gt;= 0 
+		then 0
+
+	--if the bucket less the paid = current balance, use up all the money
+	when a.T6 &gt;= 0 
+		and a.T6 - a.TotPaid &lt; 0 
+		and a.T6 - a.TotPaid = a.CurrBalance
+		and a.T5 = 0 
+		and a.T4 = 0 
+		and a.T3 = 0 
+		and a.T2 = 0 
+		and a.t1 = 0 
+		then 0
+
+	--when paid is greater than the amount then reduce the paid by the amount for remaining
+	when a.T6 &gt; 0
+		and a.T6 - a.TotPaid &lt;= 0 
+		then a.TotPaid - a.T6
+
+	--when the amount is less than 0 put the whole paid towards the negative so remaining is 0
+	when a.T6 &lt; 0 
+		and a.T5 = 0 
+		and a.T4 = 0 
+		and a.T3 = 0 
+		and a.T2 = 0 
+		and a.t1 = 0 then 0
+
+	--if the current bucket is negative, but there's later activity, add the credit to the remaining paid to be used later
+	when a.T6 &lt; 0
+		and (a.T5 &lt;&gt; 0
+		or a.t4 &lt;&gt; 0
+		or a.T3 &lt;&gt; 0
+		or a.T2 &lt;&gt; 0 
+		or a.t1 &lt;&gt; 0) then a.TotPaid - a.T6
+
+	--no activity so carry the full paid forward
+	else a.TotPaid
+
+end Over365RemainingPaid
+into #CPPOver365
+from #CPPAges a
+
+
+print('CPP Over 365')
+
+
+select t.*,
+case
+	--when the billing nets to 0 but there's still an amount paid find the bucket for how old the credit is 
+	when t.TotBilled = 0 and t.TotPaid &lt;&gt; 0 and t.LastDueDate  between DATEADD(d, -364, @EOMDate) and  DATEADD(d, -180, @EOMDate) then (t.Over365RemainingPaid - t.T5)  * -1
+
+	--if we already used the whole paid amount in the previous slice then the remainder is just the current slice
+	when t.T5 &gt;= 0 and t.Over365RemainingPaid = 0 then t.T5
+
+	--when the amount + the older slice's balance is greater than 0 and the total paid is less then the balance is the amount + the older slice's balance minus paid
+	when t.T5 &gt; 0 
+		and t.T5 - t.Over365RemainingPaid &gt;= 0 
+		then t.T5 - t.Over365RemainingPaid
+
+	--when paid is greater than the amount + the older slice's balance and the negative is the total balance then amount less total paid if the last due date was in that range
+	when t.T5 &gt;= 0
+		and t.T5 - t.Over365RemainingPaid &lt; 0 		
+		and t.T5 - t.Over365RemainingPaid = t.CurrBalance
+		and t.T4 = 0 
+		and t.T3 = 0
+		and t.T2 = 0 
+		and t.t1 = 0 
+		then t.T5 - t.Over365RemainingPaid
+
+	--when paid is greater than the amount + the older slice's balance then 0
+	when t.T5 &gt;= 0
+		and t.T5 - t.Over365RemainingPaid &lt; 0 
+		then 0
+
+	--if the current bucket is negative, but there's later activity, add the credit to the remaining paid to be used later
+	when t.T5 &lt; 0
+		and (t.t4 &lt;&gt; 0
+		or t.T3 &lt;&gt; 0
+		or t.T2 &lt;&gt; 0 
+		or t.t1 &lt;&gt; 0) then 0
+
+	--when the amount is less than 0 take the amount + the older slice's balance minus the paid (value will offset later if there's a positive)
+	--check if there is any activity in later buckets, if not, that's the bucket with the credit
+	when t.T5 &lt; 0 
+		and t.T4 = 0 
+		and t.T3 = 0 
+		and t.T2 = 0 
+		and t.t1 = 0 then t.T5 - t.Over365RemainingPaid
+
+	else 0
+
+end as [180 to 365 Bal],
+case
+	--when the billing nets to 0 but there's still an amount paid find the bucket for how old the credit is 
+	when t.TotBilled = 0 and t.TotPaid &lt;&gt; 0 and t.LastDueDate  between DATEADD(d, -364, @EOMDate) and  DATEADD(d, -180, @EOMDate) then 0
+
+	--when the amount + the older slice's balance is greater than 0 and the total paid is less the remaining paid is 0
+	when t.T5 &gt; 0
+		and t.T5 - t.Over365RemainingPaid &gt;= 0 
+		then 0
+
+	--if the bucket less the paid = current balance, use up all the money
+	when t.T5 &gt;= 0
+		and t.T5 - t.Over365RemainingPaid &lt; 0 		
+		and t.T5 - t.Over365RemainingPaid = t.CurrBalance
+		and t.T4 = 0 
+		and t.T3 = 0
+		and t.T2 = 0 
+		and t.t1 = 0 
+		then 0
+
+	--if paid is more than the bucket, but that negative is the current balance, put the whole amount into the bucket
+	when t.T5 &gt;= 0
+		and t.T5 - t.Over365RemainingPaid &lt; 0 		
+		and t.T5 - t.Over365RemainingPaid = t.CurrBalance
+		and t.T4 = 0 
+		and t.T3 = 0
+		and t.T2 = 0 
+		and t.t1 = 0 
+		then 0
+
+	--when paid is greater than the amount + the older slice's balance then reduce the paid by the amount + the older slice's balance for remaining
+	when t.T5 &gt;= 0
+		and t.T5 - t.Over365RemainingPaid &lt; 0 
+		then t.Over365RemainingPaid - T5
+
+	--when the amount + the older slice's balance is less than 0 put the whole paid towards the negative so remaining is 0
+	--only move to the balance on the last bucket, otherwise bring the remaining paid forward
+	when t.T5 &lt; 0 
+		and t.T4 = 0 
+		and t.T3 = 0 
+		and t.T2 = 0 
+		and t.t1 = 0 then 0
+
+	--if the current bucket is negative, but there's later activity, add the credit to the remaining paid to be used later
+	when t.T5 &lt; 0
+		and (t.t4 &lt;&gt; 0
+		or t.T3 &lt;&gt; 0
+		or t.T2 &lt;&gt; 0 
+		or t.t1 &lt;&gt; 0) then t.Over365RemainingPaid - t.T5
+
+	--no activity so carry the full paid forward
+	else t.Over365RemainingPaid
+
+end as [180 to 365 Paid]
+into #CPP180To365Bal
+from #CPPOver365 t
+
+print('CPP 180 to 365')
+
+
+select t.*,
+case
+	--when the billing nets to 0 but there's still an amount paid find the bucket for how old the credit is 
+	when t.TotBilled = 0 and t.TotPaid &lt;&gt; 0 and t.LastDueDate  between DATEADD(d, -364, @EOMDate) and  DATEADD(d, -180, @EOMDate) then (t.[180 to 365 Paid] - t.T4) * -1
+
+	--if we already used the whole paid amount in the previous slice then the remainder is just the current slice
+	when t.T4 &gt;= 0 and  t.[180 to 365 Paid] = 0 then t.T4
+
+	--when the amount + the older slice's balance is greater than 0 and the total paid is less then the balance is the amount + the older slice's balance minus paid
+	when t.T4 &gt; 0 
+		and t.T4 - t.[180 to 365 Paid] &gt;= 0 
+		then t.T4 - t.[180 to 365 Paid]
+
+	--when paid is greater than the amount + the older slice's balance and the negative is the total balance then amount less total paid if the last due date was in that range
+	when t.T4 &gt;= 0
+		and t.T4 - t.[180 to 365 Paid] &lt; 0 		
+		and t.T4 - t.[180 to 365 Paid] = t.CurrBalance
+		and t.T3 = 0
+		and t.T2 = 0 
+		and t.t1 = 0 
+		then t.T4 - t.[180 to 365 Paid]
+
+	--when paid is greater than the amount + the older slice's balance then 0
+	when t.T4 &gt;= 0
+		and t.T4 - t.[180 to 365 Paid] &lt; 0 
+		then 0
+
+	--if the current bucket is negative, but there's later activity, add the credit to the remaining paid to be used later
+	when t.T4 &lt; 0
+		and (t.T3 &lt;&gt; 0
+		or t.T2 &lt;&gt; 0 
+		or t.t1 &lt;&gt; 0) then 0
+
+	--when the amount is less than 0 take the amount + the older slice's balance minus the paid (value will offset later if there's a positive)
+	--check if there is any activity in later buckets, if not, that's the bucket with the credit
+	when t.T4 &lt; 0 
+		and t.T3 = 0
+		and t.T2 = 0 
+		and t.t1 = 0 then t.T4 - t.[180 to 365 Paid]
+
+	else 0
+
+end as [90 to 180 Bal],
+case
+	--when the billing nets to 0 but there's still an amount paid find the bucket for how old the credit is 
+	when t.TotBilled = 0 and t.TotPaid &lt;&gt; 0 and t.LastDueDate  between DATEADD(d, -364, @EOMDate) and  DATEADD(d, -180, @EOMDate) then 0
+
+	--when the amount + the older slice's balance is greater than 0 and the total paid is less the remaining paid is 0
+	when t.T4 &gt; 0
+		and t.T4 - t.[180 to 365 Paid] &gt;= 0 
+		then 0
+
+	--if the bucket less the paid = current balance, use up all the money
+	when t.T4 &gt;= 0
+		and t.T4 - t.[180 to 365 Paid] &lt; 0 		
+		and t.T4 - t.[180 to 365 Paid] = t.CurrBalance
+		and t.T3 = 0
+		and t.T2 = 0 
+		and t.t1 = 0 
+		then 0
+
+	--if paid is more than the bucket, but that negative is the current balance, put the whole amount into the bucket
+	when t.T4 &gt;= 0
+		and t.T4 - t.[180 to 365 Paid] &lt; 0 		
+		and t.T4 - t.[180 to 365 Paid] = t.CurrBalance
+		and t.T3 = 0
+		and t.T2 = 0 
+		and t.t1 = 0 
+		then 0
+
+	--when paid is greater than the amount + the older slice's balance then reduce the paid by the amount + the older slice's balance for remaining
+	when t.T4 &gt;= 0
+		and t.T4 - t.[180 to 365 Paid] &lt; 0 
+		then t.[180 to 365 Paid] - T4
+
+	--when the amount + the older slice's balance is less than 0 put the whole paid towards the negative so remaining is 0
+	when t.T4 &lt; 0
+		and t.T3 = 0
+		and t.T2 = 0 
+		and t.t1 = 0 then 0
+
+	--if the current bucket is negative, but there's later activity, add the credit to the remaining paid to be used later
+	when t.T4 &lt; 0
+		and (t.T3 &lt;&gt; 0
+		or t.T2 &lt;&gt; 0 
+		or t.t1 &lt;&gt; 0) then t.[180 to 365 Paid] - t.T4
+
+	--no activity so carry the full paid forward
+	else t.[180 to 365 Paid]
+
+end as [90 to 180 Paid]
+into #CPP90to180
+from #CPP180To365Bal t
+
+print('CPP 90 to 180')
+
+
+select t.*,
+case
+	--when the billing nets to 0 but there's still an amount paid find the bucket for how old the credit is 
+	when t.TotBilled = 0 and t.TotPaid &lt;&gt; 0 and t.LastDueDate  between DATEADD(d, -89, @EOMDate) and  DATEADD(d, -60, @EOMDate) then (t.[90 to 180 Paid] - t.T3) * -1
+
+	--if we already used the whole paid amount in the previous slice then the remainder is just the current slice
+	when t.T3 &gt;= 0 and  t.[90 to 180 Paid] = 0 then t.T3
+
+	--when the amount + the older slice's balance is greater than 0 and the total paid is less then the balance is the amount + the older slice's balance minus paid
+	when t.T3 &gt; 0 
+		and  t.T3 - t.[90 to 180 Paid] &gt;= 0 
+		then t.T3 - t.[90 to 180 Paid]
+
+	--when paid is greater than the amount + the older slice's balance and the negative is the total balance then amount less total paid if the last due date was in that range
+	when t.T3 &gt;= 0
+		and t.T3 - t.[90 to 180 Paid] &lt; 0 		
+		and t.T3 - t.[90 to 180 Paid] = t.CurrBalance
+		and t.T2 = 0 
+		and t.t1 = 0 
+		then t.T3 - t.[90 to 180 Paid]
+
+	--when paid is greater than the amount + the older slice's balance then 0
+	when t.T3 &gt;= 0
+		and t.T3 - t.[90 to 180 Paid] &lt; 0 
+		then 0
+
+	--if the current bucket is negative, but there's later activity, add the credit to the remaining paid to be used later
+	when t.T3 &lt; 0
+		and (t.T2 &lt;&gt; 0 
+		or t.t1 &lt;&gt; 0) then 0
+
+	--when the amount is less than 0 take the amount + the older slice's balance minus the paid (value will offset later if there's a positive)
+	when t.T3 &lt; 0
+		and t.T2 = 0 
+		and t.t1 = 0 then t.T3 - t.[90 to 180 Paid]
+
+	else 0
+
+end as [60 to 90 Bal],
+case
+	--when the billing nets to 0 but there's still an amount paid find the bucket for how old the credit is 
+	when t.TotBilled = 0 and t.TotPaid &lt;&gt; 0 and t.LastDueDate  between DATEADD(d, -89, @EOMDate) and  DATEADD(d, -60, @EOMDate) then 0
+
+	--when the amount + the older slice's balance is greater than 0 and the total paid is less the remaining paid is 0
+	when t.T3 &gt; 0
+		and t.T3 - t.[90 to 180 Paid] &gt;= 0 
+		then 0
+
+	--if the bucket less the paid = current balance, use up all the money
+	when t.T3 &gt;= 0
+		and t.T3 - t.[90 to 180 Paid] &lt; 0 		
+		and t.T3 - t.[90 to 180 Paid] = t.CurrBalance
+		and t.T2 = 0 
+		and t.t1 = 0 
+		then 0
+
+	--if paid is more than the bucket, but that negative is the current balance, put the whole amount into the bucket
+	when t.T3 &gt;= 0
+		and t.T3 - t.[90 to 180 Paid] &lt; 0 		
+		and t.T3 - t.[90 to 180 Paid] = t.CurrBalance
+		and t.T2 = 0 
+		and t.t1 = 0 
+		then 0
+
+	--when paid is greater than the amount + the older slice's balance then reduce the paid by the amount + the older slice's balance for remaining
+	when t.T3 &gt;= 0
+		and t.T3 - t.[90 to 180 Paid] &lt; 0 
+		then t.[90 to 180 Paid] - T3
+
+	--when the amount + the older slice's balance is less than 0 put the whole paid towards the negative so remaining is 0
+	when t.T3 &lt; 0
+		and t.T2 = 0 
+		and t.t1 = 0 
+		then 0
+
+	--if the current bucket is negative, but there's later activity, add the credit to the remaining paid to be used later
+	when t.T3 &lt; 0
+		and (t.T2 &lt;&gt; 0 
+		or t.t1 &lt;&gt; 0) then t.[90 to 180 Paid] - t.T3
+
+	--no activity so carry the full paid forward
+	else t.[90 to 180 Paid]
+
+end as [60 to 90 Paid]
+into #CPP60To90Bal
+from #CPP90to180 t
+
+print('CPP 60 to 90')
+
+select t.*,
+case
+	--when the billing nets to 0 but there's still an amount paid find the bucket for how old the credit is 
+	when t.TotBilled = 0 and t.TotPaid &lt;&gt; 0 and t.LastDueDate  between DATEADD(d, -59, @EOMDate) and DATEADD(d, -30, @EOMDate) then (t.[60 to 90 Paid] - t.T2) * -1
+
+	--if we already used the whole paid amount in the previous slice then the remainder is just the current slice
+	when t.T2 &gt;= 0 and t.[60 to 90 Paid] = 0 then t.T2
+
+	--when the amount + the older slice's balance is greater than 0 and the total paid is less then the balance is the amount + the older slice's balance minus paid
+	when t.T2 &gt; 0 
+		and  t.T2 - t.[60 to 90 Paid] &gt;= 0 
+		then t.T2 - t.[60 to 90 Paid]
+
+	--when paid is greater than the amount + the older slice's balance and the negative is the total balance then amount less total paid
+	when t.T2 &gt;= 0
+		and t.T2 - t.[60 to 90 Paid] &lt; 0 
+		and t.T2 - t.[60 to 90 Paid] = t.CurrBalance
+		and t.T1 = 0
+		then t.T2 - t.[60 to 90 Paid]
+
+	when t.T2 &gt;= 0
+		and t.T2 - t.[60 to 90 Paid] &lt; 0 
+		then 0
+
+	--if the current bucket is negative, but there's later activity, add the credit to the remaining paid to be used later
+	when t.T2 &lt; 0
+		and t.t1 &lt;&gt; 0 then 0
+
+	--when the amount is less than 0 take the amount + the older slice's balance minus the paid (value will offset later if there's a positive)
+	when t.T2 &lt; 0
+		and t.T1 = 0 
+		then t.T2 - t.[60 to 90 Paid]
+
+	else 0
+
+end as [30 to 60 Bal],
+case
+	--when the billing nets to 0 but there's still an amount paid find the bucket for how old the credit is 
+	when t.TotBilled = 0 and t.TotPaid &lt;&gt; 0 and t.LastDueDate  between DATEADD(d, -59, @EOMDate) and DATEADD(d, -30, @EOMDate) then 0
+
+	--when the amount + the older slice's balance is greater than 0 and the total paid is less the remaining paid is 0
+	when t.T2 &gt; 0
+		and t.T2 - t.[60 to 90 Paid] &gt;= 0 
+		then 0
+
+	--if the bucket less the paid = current balance, use up all the money
+	when t.T2 &gt; 0 
+		and  t.T2 - t.[60 to 90 Paid] &gt;= 0 
+		then 0
+
+	--if paid is more than the bucket, but that negative is the current balance, put the whole amount into the bucket
+	when t.T2 &gt;= 0
+		and t.T2 - t.[60 to 90 Paid] &lt; 0 
+		and t.T2 - t.[60 to 90 Paid] = t.CurrBalance
+		and t.T1 = 0
+		then 0
+
+	--when paid is greater than the amount + the older slice's balance then reduce the paid by the amount + the older slice's balance for remaining
+	when t.T2 &gt;= 0
+		and t.T2 - t.[60 to 90 Paid] &lt; 0 
+		then t.[60 to 90 Paid] - T2
+
+	--when the amount + the older slice's balance is less than 0 put the whole paid towards the negative so remaining is 0
+	when t.T2 &lt; 0
+		and t.T1 = 0 
+		then 0
+
+	--if the current bucket is negative, but there's later activity, add the credit to the remaining paid to be used later
+	when t.T2 &lt; 0
+		and t.t1 &lt;&gt; 0 then t.[60 to 90 Paid] - t.T2
+
+	--no activity so carry the full paid forward
+	else t.[60 to 90 Paid]
+
+end as [30 to 60 Paid]
+into #CPP30To60Bal
+from #CPP60To90Bal t
+
+print('CPP 30 to 60')
+
+select t.*,
+--no matter what, use up on the remaining money on the newest bucket, can't leave money in paid
+t.T1 - t.[30 to 60 Paid] as [0 to 30 Bal],
+
+0 as [0 to 30 Paid]
+into #CPP0To30Bal
+from #CPP30To60Bal t
+
+print('CPP 0 to 30')
+
+
+/* --Testing Validation that everthing balances
+select w.PolicyID, w.Policy, w.BillType, w.t1, w.t2, w.t3, w.t4, w.t5, w.t6, 
+w.[0 to 30 Paid], 
+w.[30 to 60 Paid], 
+w.[60 to 90 Paid], 
+w.[90 to 180 Paid], 
+w.[180 to 365 Paid], 
+w.Over365RemainingPaid,
+
+w.PolicyCost, w.TotBilled, w.TotPaid, w.Balance, w.CurrBalance, 
+round((w.[0 to 30 Bal] 
+		+ w.[30 to 60 Bal]
+		+ w.[60 to 90 Bal] 
+		+ w.[90 to 180 Bal] 
+		+ w.[180 to 365 Bal] 
+		+ w.[Over 365 Bal]), 2) as BucketTotal,
+
+w.[0 to 30 Bal], w.[30 to 60 Bal], w.[60 to 90 Bal], w.[90 to 180 Bal], w.[180 to 365 Bal], w.[Over 365 Bal], 
+(w.[0 to 30 Bal] 
++ w.[30 to 60 Bal]
++ w.[60 to 90 Bal] 
++ w.[90 to 180 Bal] 
++ w.[180 to 365 Bal] 
++ w.[Over 365 Bal]) - w.CurrBalance as Diff
+from #WC0To30Bal w
+where round((w.[0 to 30 Bal] 
+		+ w.[30 to 60 Bal]
+		+ w.[60 to 90 Bal] 
+		+ w.[90 to 180 Bal] 
+		+ w.[180 to 365 Bal] 
+		+ w.[Over 365 Bal]), 2) &lt;&gt; round(w.CurrBalance, 2)
+
+
+
+select w.PolicyID, w.Policy, w.t1, w.t2, w.t3, w.t4, w.t5, w.t6, 
+w.[0 to 30 Paid], 
+w.[30 to 60 Paid], 
+w.[60 to 90 Paid], 
+w.[90 to 180 Paid], 
+w.[180 to 365 Paid], 
+w.Over365RemainingPaid,
+
+w.PolicyCost, w.TotBilled, w.TotPaid, w.Balance, w.CurrBalance, 
+round((w.[0 to 30 Bal] 
+		+ w.[30 to 60 Bal]
+		+ w.[60 to 90 Bal] 
+		+ w.[90 to 180 Bal] 
+		+ w.[180 to 365 Bal] 
+		+ w.[Over 365 Bal]), 2) as BucketTotal,
+
+w.[0 to 30 Bal], w.[30 to 60 Bal], w.[60 to 90 Bal], w.[90 to 180 Bal], w.[180 to 365 Bal], w.[Over 365 Bal], 
+(w.[0 to 30 Bal] 
++ w.[30 to 60 Bal]
++ w.[60 to 90 Bal] 
++ w.[90 to 180 Bal] 
++ w.[180 to 365 Bal] 
++ w.[Over 365 Bal]) - w.CurrBalance as Diff
+from #CPP0To30Bal w
+where round((w.[0 to 30 Bal] 
+		+ w.[30 to 60 Bal]
+		+ w.[60 to 90 Bal] 
+		+ w.[90 to 180 Bal] 
+		+ w.[180 to 365 Bal] 
+		+ w.[Over 365 Bal]), 2) &lt;&gt; round(w.CurrBalance, 2)
+
+*/
+
+--added PolicyID to output
+
+select t.Policy, t.PolicyID, t.LOB, t.FirmID, t.AgtId, t.AgtGroup, t.UwOfc, t.DateEffective, t.DateExpiration, t.DateCanc, t.DateAudit, t.BillType, t.ProductType, t.Bankruptcy, isnull(t.NoRefund, 0) as NoRefund, isnull(t.StopInvoice, 0) as StopInvoice, isnull(t.StopAuditInvoice, 0) as StopAuditInvoice,
+t.[Collections Start Date],t.TotalTax, t.TotalFee, t.BilledTax, t.BilledFee,t.PolicyCost,
+t.TotPaid as [Total Paid], t.TotBilled as [Total Billed], t.CurrBalance, t.[0 to 30 Bal], t.[30 to 60 Bal], t.[60 to 90 Bal], t.[90 to 180 Bal], t.[180 to 365 Bal], t.[Over 365 Bal], t.FutureDue
+
+into #GlobalData
+	from (
+	select *
+	from #WC0To30Bal w
+
+	union all
+
+	select *
+	from #CPP0To30Bal w
+	) t
+order by t.LOB, t.DateEffective
+
+
+
+
+--Agency Bill Aged
+select g.Policy,
+isnull(i.InsName, iv.InsName) as InsName,
+g.AgtId,
+a.AgtName,
+g.AgtGroup,
+g.UwOfc,
+g.FirmID,
+g.BillType,
+g.DateEffective,
+g.DateExpiration,
+g.DateCanc,
+g.DateAudit,
+case
+	when g.[Collections Start Date] is not null then 1
+	else 0
+end as [In Collections],
+isnull(g.[Total Billed], 0) as [Total Billed],
+isnull(g.[Total Paid], 0) as [Total Paid],
+isnull(g.CurrBalance, 0) as [Current Balance],
+g.[0 to 30 Bal],
+g.[30 to 60 Bal],
+g.[60 to 90 Bal],
+g.[90 to 180 Bal],
+g.[180 to 365 Bal],
+g.[Over 365 Bal],
+g.FutureDue
+from #GlobalData g
+inner join Premdat.dbo.Agents a (nolock)
+	on g.AgtId = a.AgtID
+left join Premdat.dbo.PolicyData pd (nolock)
+	on g.PolicyID = pd.PolicyID
+	and g.LOB = 'WC'
+left join Premdat.dbo.Insureds i (nolock)
+	on pd.InsID = i.InsID
+left join CPP.dbo.CPPPolicySubData_View sv (nolock)
+	on g.PolicyID = sv.PolicyID
+	and g.LOB = 'CPP'
+left join CPP.dbo.InsuredsSubData_View iv (nolock)
+	on sv.InsID = iv.InsID
+where g.BillType = 'A'
+--and g.AgtId not in(17208, 17216, 17647, 49616, 49617, 49618, 78949, 78950, 17652)
+--and g.FirmID not in(30, 33, 77, 78, 80, 81, 64)
+order by g.Policy
+
+
+----Motor Carrier Aged
+--select g.Policy,
+--iv.InsName,
+--g.AgtId,
+--g.AgtGroup,
+--case
+--	when sv.[PremiumFinancedCompany] = 'None' then NULL
+--	else pfc.PremFinName
+--end as [PremiumFinancedCompany],
+--g.BillType,
+--g.DateEffective,
+--g.DateExpiration,
+--g.DateCanc,
+--g.DateAudit,
+--CASE
+--      WHEN sv.AuditDate IS NOT NULL AND sv.AuditVersion = 2 AND ISNULL(sv.DateCanc, '1/1/1900') &lt;&gt; sv.DateEffective THEN 'AUDITED'
+--      WHEN ISNULL(sv.DateCanc, '1/1/1900') = sv.DateEffective THEN 'CLOSED'
+--      WHEN ISNULL(sv.DateCanc, '1/1/1900') &gt; sv.DateEffective THEN 'CANCELLED'
+--      WHEN sv.AuditDate IS NOT NULL AND sv.AuditVersion &lt;&gt; 2 THEN 'CLOSED'
+--      WHEN sv.AuditDate IS NULL AND sv.DateCanc IS NULL AND sv.NonRenewedDate IS NOT NULL THEN 'NON RENEWED'
+--      WHEN sv.AuditDate IS NULL AND sv.DateCanc IS NULL AND sv.NonRenewedDate IS NULL AND GETDATE() &gt; sv.DateExpiration THEN 'EXPIRED'
+--      ELSE 'ACTIVE'
+--	END as [PolicyStatus],
+--case
+--	when g.[Collections Start Date] is not null then 1
+--	else 0
+--end as [In Collections],
+--isnull(g.PolicyCost, 0) as [Policy Cost],
+--isnull(g.[Total Billed], 0) as [Total Billed],
+--isnull(g.[Total Paid], 0) as [Total Paid],
+--isnull(g.CurrBalance, 0) as [Current Balance],
+--g.[0 to 30 Bal],
+--g.[30 to 60 Bal],
+--g.[60 to 90 Bal],
+--g.[90 to 180 Bal],
+--g.[180 to 365 Bal],
+--g.[Over 365 Bal],
+--g.FutureDue
+
+--from #GlobalData g
+--inner join cpp.dbo.CPPPolicySubData_View sv (nolocK)
+--	on g.PolicyID = sv.PolicyID
+--inner join cpp.dbo.InsuredsSubData_View iv (nolock)
+--	on sv.insid = iv.insid
+--left join Premdat.dbo.PremFinCo pfc (nolock)
+--	on sv.[PremiumFinancedCompany] = cast(pfc.PremFinID as varchar(50))
+--where g.ProductType = 'MOTCAR'
+--order by g.Policy
+
+
+drop table if exists #WCPolicies
+drop table if exists #WCAges 
+drop table if exists #WCPremInvAmts
+drop table if exists #WC0To30Bal, #WC30To60Bal, #WC60To90Bal, #WC90to180, #WC180To365Bal, #WCOver365
+
+drop table if exists #CPPPolicies
+drop table if exists #CPPAges, #CPPPremInvAmts
+drop table if exists #CPP0To30Bal, #CPP30To60Bal, #CPP60To90Bal, #CPP90to180, #CPP180To365Bal, #CPPOver365
+drop table if exists #GlobalData
+drop table if exists #ExcelCalc</CommandText>
+        <rd:UseGenericDesigner>true</rd:UseGenericDesigner>
+      </Query>
+      <Fields>
+        <Field Name="Policy">
+          <DataField>Policy</DataField>
+          <rd:TypeName>System.String</rd:TypeName>
+        </Field>
+        <Field Name="InsName">
+          <DataField>InsName</DataField>
+          <rd:TypeName>System.String</rd:TypeName>
+        </Field>
+        <Field Name="AgtId">
+          <DataField>AgtId</DataField>
+          <rd:TypeName>System.Int32</rd:TypeName>
+        </Field>
+        <Field Name="AgtName">
+          <DataField>AgtName</DataField>
+          <rd:TypeName>System.String</rd:TypeName>
+        </Field>
+        <Field Name="AgtGroup">
+          <DataField>AgtGroup</DataField>
+          <rd:TypeName>System.Int32</rd:TypeName>
+        </Field>
+        <Field Name="FirmID">
+          <DataField>FirmID</DataField>
+          <rd:TypeName>System.Int32</rd:TypeName>
+        </Field>
+        <Field Name="BillType">
+          <DataField>BillType</DataField>
+          <rd:TypeName>System.String</rd:TypeName>
+        </Field>
+        <Field Name="DateEffective">
+          <DataField>DateEffective</DataField>
+          <rd:TypeName>System.DateTime</rd:TypeName>
+        </Field>
+        <Field Name="DateExpiration">
+          <DataField>DateExpiration</DataField>
+          <rd:TypeName>System.DateTime</rd:TypeName>
+        </Field>
+        <Field Name="DateCanc">
+          <DataField>DateCanc</DataField>
+          <rd:TypeName>System.DateTime</rd:TypeName>
+        </Field>
+        <Field Name="DateAudit">
+          <DataField>DateAudit</DataField>
+          <rd:TypeName>System.DateTime</rd:TypeName>
+        </Field>
+        <Field Name="In_Collections">
+          <DataField>In Collections</DataField>
+          <rd:TypeName>System.Int32</rd:TypeName>
+        </Field>
+        <Field Name="Total_Billed">
+          <DataField>Total Billed</DataField>
+          <rd:TypeName>System.Decimal</rd:TypeName>
+        </Field>
+        <Field Name="uwofc">
+          <DataField>UwOfc</DataField>
+          <rd:TypeName>System.Int32</rd:TypeName>
+        </Field>
+        <Field Name="Total_Paid">
+          <DataField>Total Paid</DataField>
+          <rd:TypeName>System.Decimal</rd:TypeName>
+        </Field>
+        <Field Name="Current_Balance">
+          <DataField>Current Balance</DataField>
+          <rd:TypeName>System.Decimal</rd:TypeName>
+        </Field>
+        <Field Name="ID0_to_30_Bal">
+          <DataField>0 to 30 Bal</DataField>
+          <rd:TypeName>System.Decimal</rd:TypeName>
+        </Field>
+        <Field Name="ID30_to_60_Bal">
+          <DataField>30 to 60 Bal</DataField>
+          <rd:TypeName>System.Decimal</rd:TypeName>
+        </Field>
+        <Field Name="ID60_to_90_Bal">
+          <DataField>60 to 90 Bal</DataField>
+          <rd:TypeName>System.Decimal</rd:TypeName>
+        </Field>
+        <Field Name="ID90_to_180_Bal">
+          <DataField>90 to 180 Bal</DataField>
+          <rd:TypeName>System.Decimal</rd:TypeName>
+        </Field>
+        <Field Name="ID180_to_365_Bal">
+          <DataField>180 to 365 Bal</DataField>
+          <rd:TypeName>System.Decimal</rd:TypeName>
+        </Field>
+        <Field Name="Over_365_Bal">
+          <DataField>Over 365 Bal</DataField>
+          <rd:TypeName>System.Decimal</rd:TypeName>
+        </Field>
+        <Field Name="FutureDue">
+          <DataField>FutureDue</DataField>
+          <rd:TypeName>System.Double</rd:TypeName>
+        </Field>
+      </Fields>
+    </DataSet>
+  </DataSets>
+  <ReportSections>
+    <ReportSection>
+      <Body>
+        <ReportItems>
+          <Textbox Name="textbox1">
+            <CanGrow>true</CanGrow>
+            <KeepTogether>true</KeepTogether>
+            <Paragraphs>
+              <Paragraph>
+                <TextRuns>
+                  <TextRun>
+                    <Value>Agency Bill Aged Report</Value>
+                    <Style>
+                      <FontFamily>Segoe UI Light</FontFamily>
+                      <FontSize>14pt</FontSize>
+                      <FontWeight>Bold</FontWeight>
+                    </Style>
+                  </TextRun>
+                </TextRuns>
+                <Style />
+              </Paragraph>
+            </Paragraphs>
+            <rd:DefaultName>textbox1</rd:DefaultName>
+            <Height>0.43in</Height>
+            <Width>2.46875in</Width>
+            <Style>
+              <PaddingLeft>2pt</PaddingLeft>
+              <PaddingRight>2pt</PaddingRight>
+              <PaddingTop>2pt</PaddingTop>
+              <PaddingBottom>2pt</PaddingBottom>
+            </Style>
+          </Textbox>
+          <Tablix Name="table1">
+            <TablixBody>
+              <TablixColumns>
+                <TablixColumn>
+                  <Width>2.65625in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>2.32292in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1.85417in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1.38542in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1.61458in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1.04167in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1.20833in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1.14583in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1.40625in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1.04166in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1.04167in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1.17708in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1.28125in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1.38542in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1.11458in</Width>
+                </TablixColumn>
+                <TablixColumn>
+                  <Width>1.33333in</Width>
+                </TablixColumn>
+              </TablixColumns>
+              <TablixRows>
+                <TablixRow>
+                  <Height>0.22in</Height>
+                  <TablixCells>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox2">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Policy</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox2</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox3">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Ins Name</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox3</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox4">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Agt Id</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <FontFamily />
+                                <TextAlign>Right</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox4</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="Textbox23">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Agt Name</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <TextAlign>Right</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>Textbox23</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox5">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Agt Group</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <FontFamily />
+                                <TextAlign>Right</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox5</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="Textbox25">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>uwofc</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <TextAlign>Right</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>Textbox25</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox6">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Firm ID</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <FontFamily />
+                                <TextAlign>Right</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox6</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox7">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Bill Type</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox7</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox8">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Date Effective</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox8</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox9">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Date Expiration</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox9</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox10">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Date Canc</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox10</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox11">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Date Audit</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox11</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox12">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>In Collections</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <FontFamily />
+                                <TextAlign>Right</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox12</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox13">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Total Billed</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <FontFamily />
+                                <TextAlign>Right</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox13</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox14">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Total Paid</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <FontFamily />
+                                <TextAlign>Right</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox14</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox15">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Current Balance</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <FontFamily />
+                                <TextAlign>Right</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox15</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox16">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>ID0 to 30 Bal</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <FontFamily />
+                                <TextAlign>Right</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox16</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox17">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>ID30 to 60 Bal</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <FontFamily />
+                                <TextAlign>Right</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox17</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox18">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>ID60 to 90 Bal</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <FontFamily />
+                                <TextAlign>Right</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox18</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox19">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>ID90 to 180 Bal</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <FontFamily />
+                                <TextAlign>Right</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox19</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox20">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>ID180 to 365 Bal</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <FontFamily />
+                                <TextAlign>Right</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox20</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox21">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Over 365 Bal</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <FontFamily />
+                                <TextAlign>Right</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox21</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="textbox22">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>Future Due</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <FontSize>11pt</FontSize>
+                                    <FontWeight>Bold</FontWeight>
+                                    <Color>#666666</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style>
+                                <FontFamily />
+                                <TextAlign>Right</TextAlign>
+                              </Style>
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>textbox22</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                  </TablixCells>
+                </TablixRow>
+                <TablixRow>
+                  <Height>0.21in</Height>
+                  <TablixCells>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="Policy">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!Policy.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>Policy</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="InsName">
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!InsName.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>InsName</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="AgtId">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!AgtId.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>AgtId</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="AgtName">
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!AgtName.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>AgtName</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="AgtGroup">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!AgtGroup.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>AgtGroup</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="uwofc">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!uwofc.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>uwofc</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="FirmID">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!FirmID.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>FirmID</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="BillType">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!BillType.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>BillType</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="DateEffective">
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!DateEffective.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Format>d</Format>
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>DateEffective</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="DateExpiration">
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!DateExpiration.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Format>d</Format>
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>DateExpiration</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="DateCanc">
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!DateCanc.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Format>d</Format>
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>DateCanc</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="DateAudit">
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!DateAudit.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Format>d</Format>
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>DateAudit</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="In_Collections">
+                          <CanGrow>true</CanGrow>
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!In_Collections.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>In_Collections</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="Total_Billed">
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!Total_Billed.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Format>'$'#,0;('$'#,0)</Format>
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>Total_Billed</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                            <rd:FormatSymbolCulture>en-US</rd:FormatSymbolCulture>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="Total_Paid">
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!Total_Paid.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Format>'$'#,0;('$'#,0)</Format>
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>Total_Paid</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                            <rd:FormatSymbolCulture>en-US</rd:FormatSymbolCulture>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="Current_Balance">
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!Current_Balance.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Format>'$'#,0;('$'#,0)</Format>
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>Current_Balance</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                            <rd:FormatSymbolCulture>en-US</rd:FormatSymbolCulture>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="ID0_to_30_Bal">
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!ID0_to_30_Bal.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Format>'$'#,0;('$'#,0)</Format>
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>ID0_to_30_Bal</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                            <rd:FormatSymbolCulture>en-US</rd:FormatSymbolCulture>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="ID30_to_60_Bal">
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!ID30_to_60_Bal.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Format>'$'#,0;('$'#,0)</Format>
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>ID30_to_60_Bal</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                            <rd:FormatSymbolCulture>en-US</rd:FormatSymbolCulture>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="ID60_to_90_Bal">
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!ID60_to_90_Bal.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Format>'$'#,0;('$'#,0)</Format>
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>ID60_to_90_Bal</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                            <rd:FormatSymbolCulture>en-US</rd:FormatSymbolCulture>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="ID90_to_180_Bal">
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!ID90_to_180_Bal.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Format>'$'#,0;('$'#,0)</Format>
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>ID90_to_180_Bal</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                            <rd:FormatSymbolCulture>en-US</rd:FormatSymbolCulture>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="ID180_to_365_Bal">
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!ID180_to_365_Bal.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Format>'$'#,0;('$'#,0)</Format>
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>ID180_to_365_Bal</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                            <rd:FormatSymbolCulture>en-US</rd:FormatSymbolCulture>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="Over_365_Bal">
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!Over_365_Bal.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Format>'$'#,0;('$'#,0)</Format>
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>Over_365_Bal</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                            <rd:FormatSymbolCulture>en-US</rd:FormatSymbolCulture>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                    <TablixCell>
+                      <CellContents>
+                        <Textbox Name="FutureDue">
+                          <KeepTogether>true</KeepTogether>
+                          <Paragraphs>
+                            <Paragraph>
+                              <TextRuns>
+                                <TextRun>
+                                  <Value>=Fields!FutureDue.Value</Value>
+                                  <Style>
+                                    <FontFamily />
+                                    <Format>'$'#,0;('$'#,0)</Format>
+                                    <Color>#333333</Color>
+                                  </Style>
+                                </TextRun>
+                              </TextRuns>
+                              <Style />
+                            </Paragraph>
+                          </Paragraphs>
+                          <rd:DefaultName>FutureDue</rd:DefaultName>
+                          <Style>
+                            <Border>
+                              <Color>LightGrey</Color>
+                            </Border>
+                            <BottomBorder>
+                              <Style>Solid</Style>
+                            </BottomBorder>
+                            <FontFamily />
+                            <PaddingLeft>2pt</PaddingLeft>
+                            <PaddingRight>2pt</PaddingRight>
+                            <PaddingTop>2pt</PaddingTop>
+                            <PaddingBottom>2pt</PaddingBottom>
+                            <rd:FormatSymbolCulture>en-US</rd:FormatSymbolCulture>
+                          </Style>
+                        </Textbox>
+                      </CellContents>
+                    </TablixCell>
+                  </TablixCells>
+                </TablixRow>
+              </TablixRows>
+            </TablixBody>
+            <TablixColumnHierarchy>
+              <TablixMembers>
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+                <TablixMember />
+              </TablixMembers>
+            </TablixColumnHierarchy>
+            <TablixRowHierarchy>
+              <TablixMembers>
+                <TablixMember>
+                  <KeepWithGroup>After</KeepWithGroup>
+                  <RepeatOnNewPage>true</RepeatOnNewPage>
+                  <KeepTogether>true</KeepTogether>
+                </TablixMember>
+                <TablixMember>
+                  <Group Name="table1_Details_Group">
+                    <DataElementName>Detail</DataElementName>
+                  </Group>
+                  <TablixMembers>
+                    <TablixMember />
+                  </TablixMembers>
+                  <DataElementName>Detail_Collection</DataElementName>
+                  <DataElementOutput>Output</DataElementOutput>
+                  <KeepTogether>true</KeepTogether>
+                </TablixMember>
+              </TablixMembers>
+            </TablixRowHierarchy>
+            <DataSetName>DataSet1</DataSetName>
+            <Top>0.43in</Top>
+            <Height>0.43in</Height>
+            <Width>30.01041in</Width>
+            <ZIndex>1</ZIndex>
+            <Style />
+          </Tablix>
+        </ReportItems>
+        <Height>0.86in</Height>
+        <Style />
+      </Body>
+      <Width>30.01041in</Width>
+      <Page>
+        <LeftMargin>1in</LeftMargin>
+        <RightMargin>1in</RightMargin>
+        <TopMargin>1in</TopMargin>
+        <BottomMargin>1in</BottomMargin>
+        <Style />
+      </Page>
+    </ReportSection>
+  </ReportSections>
+  <ReportParametersLayout>
+    <GridLayoutDefinition>
+      <NumberOfColumns>4</NumberOfColumns>
+      <NumberOfRows>2</NumberOfRows>
+    </GridLayoutDefinition>
+  </ReportParametersLayout>
+  <Language>en-US</Language>
+  <ConsumeContainerWhitespace>true</ConsumeContainerWhitespace>
+  <rd:ReportUnitType>Inch</rd:ReportUnitType>
+  <rd:ReportID>da6339bd-4118-4e96-a7b2-ca245925e23b</rd:ReportID>
+</Report>
